@@ -5,6 +5,19 @@ import os
 import logging
 import psycopg
 
+
+from datetime import datetime, timedelta, timezone
+
+from qualification import (
+    decide_next,
+    text_reply,
+    RETURNING_CUSTOMER_MESSAGE
+)
+
+from whatsapp_service import send_qualification_reply
+
+
+
 from psycopg.rows import dict_row
 from qualification import decide_next
 from whatsapp_service import send_qualification_reply
@@ -40,6 +53,20 @@ CREATE TABLE IF NOT EXISTS inbound_events (
 
 CREATE INDEX IF NOT EXISTS inbound_pending_idx
 ON inbound_events (state, retry_after, created_at);
+
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS last_return_message_at
+TIMESTAMPTZ;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS return_acknowledged_at
+TIMESTAMPTZ;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS needs_admin_followup
+BOOLEAN NOT NULL DEFAULT FALSE;
+
 """
 
 
@@ -96,6 +123,7 @@ def enqueue_event(
             return cur.fetchone() is not None
 
 
+
 def process_next_event():
     """Process one pending WhatsApp event."""
 
@@ -105,6 +133,7 @@ def process_next_event():
         with db_connect() as conn:
             with conn.cursor() as cur:
 
+                # Get one incoming message
                 cur.execute("""
                     SELECT *
                     FROM inbound_events
@@ -123,6 +152,7 @@ def process_next_event():
                 event_id = event["message_id"]
                 phone = event["phone"]
 
+                # Check whether customer already exists
                 cur.execute("""
                     SELECT *
                     FROM leads
@@ -131,92 +161,185 @@ def process_next_event():
                 """, (phone,))
 
                 lead = cur.fetchone()
+                response = None
 
-                is_ad = bool(event["ad_id"])
+                # --------------------------------
+                # A. RETURNING CUSTOMER
+                # --------------------------------
+                if (
+                    lead is not None
+                    and lead["status"] in {
+                        "completed",
+                        "deferred"
+                    }
+                ):
 
-                ad_only = (
-                    os.environ.get(
-                        "QUALIFY_ONLY_AD_LEADS", "false"
-                    ).lower() == "true"
-                )
+                    now = datetime.now(timezone.utc)
 
-                if lead is None and ad_only and not is_ad:
-
-                    # New non-ad contact:
-                    # do not start lead screening.
-                    cur.execute("""
-                        INSERT INTO leads
-                        (phone, step, status)
-                        VALUES (%s, 'closed', 'human')
-                    """, (phone,))
-
-                    response = None
-
-                else:
-
-                    updated, response = decide_next(
-                        lead,
-                        event["message_text"]
+                    last_message = lead.get(
+                        "last_return_message_at"
                     )
 
-                    if lead is None:
-                        cur.execute("""
-                            INSERT INTO leads
-                            (
-                                phone,
-                                step,
-                                status,
-                                project_status,
-                                completion_timeline,
-                                project_location,
-                                preferred_site_visit,
-                                ad_id
-                            )
-                            VALUES (
-                                %s, %s, %s, %s,
-                                %s, %s, %s, %s
-                            )
-                        """, (
-                            phone,
-                            updated["step"],
-                            updated["status"],
-                            updated["project_status"],
-                            updated["completion_timeline"],
-                            updated["project_location"],
-                            updated["preferred_site_visit"],
-                            event["ad_id"]
-                        ))
+                    # New session after 24 hours
+                    # without returning-customer activity.
+                    should_acknowledge = (
+                        last_message is None
+                        or now - last_message
+                        >= timedelta(hours=24)
+                    )
 
-                    else:
+                    # Flag for admin review on EVERY
+                    # returning-customer message.
+                    cur.execute("""
+                        UPDATE leads
+                        SET
+                            last_return_message_at = NOW(),
+                            needs_admin_followup = TRUE,
+                            updated_at = NOW()
+                        WHERE phone = %s
+                    """, (phone,))
+
+                    if should_acknowledge:
+
+                        response = text_reply(
+                            RETURNING_CUSTOMER_MESSAGE
+                        )
+
                         cur.execute("""
                             UPDATE leads
                             SET
-                                step = %s,
-                                status = %s,
-                                project_status = %s,
-                                completion_timeline = %s,
-                                project_location = %s,
-                                preferred_site_visit = %s,
-                                ad_id = COALESCE(ad_id, %s),
-                                updated_at = NOW()
+                                return_acknowledged_at = NOW()
                             WHERE phone = %s
-                        """, (
-                            updated["step"],
-                            updated["status"],
-                            updated["project_status"],
-                            updated["completion_timeline"],
-                            updated["project_location"],
-                            updated["preferred_site_visit"],
-                            event["ad_id"],
-                            phone
-                        ))
+                        """, (phone,))
 
+                    logger.info(
+                        "Returning customer activity: "
+                        "last4=%s acknowledgement=%s",
+                        phone[-4:],
+                        should_acknowledge
+                    )
+
+                # --------------------------------
+                # B. NEW CUSTOMER / SCREENING
+                # --------------------------------
+                else:
+
+                    is_ad = bool(event["ad_id"])
+
+                    ad_only = (
+                        os.environ.get(
+                            "QUALIFY_ONLY_AD_LEADS",
+                            "false"
+                        ).lower() == "true"
+                    )
+
+                    # New contact not from an ad
+                    # when ad-only screening enabled
+                    if (
+                        lead is None
+                        and ad_only
+                        and not is_ad
+                    ):
+
+                        cur.execute("""
+                            INSERT INTO leads
+                            (phone, step, status,
+                             needs_admin_followup)
+                            VALUES (
+                                %s,
+                                'closed',
+                                'human',
+                                TRUE
+                            )
+                        """, (phone,))
+
+                    else:
+
+                        updated, response = decide_next(
+                            lead,
+                            event["message_text"]
+                        )
+
+                        if lead is None:
+
+                            cur.execute("""
+                                INSERT INTO leads (
+                                    phone,
+                                    step,
+                                    status,
+                                    project_status,
+                                    completion_timeline,
+                                    project_location,
+                                    preferred_site_visit,
+                                    ad_id,
+                                    needs_admin_followup
+                                )
+                                VALUES (
+                                    %s, %s, %s, %s, %s,
+                                    %s, %s, %s, FALSE
+                                )
+                            """, (
+                                phone,
+                                updated["step"],
+                                updated["status"],
+                                updated["project_status"],
+                                updated["completion_timeline"],
+                                updated["project_location"],
+                                updated["preferred_site_visit"],
+                                event["ad_id"]
+                            ))
+
+                        else:
+
+                            cur.execute("""
+                                UPDATE leads
+                                SET
+                                    step = %s,
+                                    status = %s,
+                                    project_status = %s,
+                                    completion_timeline = %s,
+                                    project_location = %s,
+                                    preferred_site_visit = %s,
+                                    ad_id = COALESCE(
+                                        ad_id, %s
+                                    ),
+                                    updated_at = NOW()
+                                WHERE phone = %s
+                            """, (
+                                updated["step"],
+                                updated["status"],
+                                updated["project_status"],
+                                updated["completion_timeline"],
+                                updated["project_location"],
+                                updated["preferred_site_visit"],
+                                event["ad_id"],
+                                phone
+                            ))
+
+                            # Completed/human enquiries
+                            # can be reviewed by admin.
+                            if updated["status"] in {
+                                "completed",
+                                "human"
+                            }:
+                                cur.execute("""
+                                    UPDATE leads
+                                    SET needs_admin_followup = TRUE
+                                    WHERE phone = %s
+                                """, (phone,))
+
+                # --------------------------------
+                # C. SEND RESPONSE IF REQUIRED
+                # --------------------------------
                 if response:
                     send_qualification_reply(
                         phone,
                         response
                     )
 
+                # --------------------------------
+                # D. MARK EVENT AS PROCESSED
+                # --------------------------------
                 cur.execute("""
                     UPDATE inbound_events
                     SET
@@ -270,7 +393,7 @@ def process_next_event():
 
             except Exception:
                 logger.exception(
-                    "Unable to record webhook processing failure"
+                    "Unable to record processing failure"
                 )
 
         return False

@@ -72,6 +72,15 @@ def visit_question():
     )
 
 
+RETURNING_CUSTOMER_MESSAGE = (
+    "Welcome back to HYTOMA Automation! 👋\n\n"
+    "Thank you for reaching out again. "
+    "Our team will review your message "
+    "and assist you shortly."
+)
+
+
+
 FINAL_MESSAGE = (
     "Thank you for sharing your details with "
     "HYTOMA Automation! ✅\n\n"
