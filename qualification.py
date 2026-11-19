@@ -1,101 +1,155 @@
 
-"""HYTOMA WhatsApp lead qualification logic."""
+"""HYTOMA WhatsApp qualification flow."""
 
-INTRO = (
-    "Welcome to HYTOMA Automation! 👋\n"
-    "Please answer a few quick questions so our team can assist you.\n\n"
-)
 
-STATUS_QUESTION = (
-    "1/4. What is your current project status?\n"
-    "Reply with a number:\n"
-    "1. Planning\n"
-    "2. Under construction\n"
-    "3. Interiors in progress\n"
-    "4. Completed"
-)
+def text_reply(message):
+    return {
+        "type": "text",
+        "body": message
+    }
 
-TIMELINE_QUESTION = (
-    "2/4. When do you expect construction/interior work to finish?\n"
-    "1. Within 1 month\n"
-    "2. 1–3 months\n"
-    "3. 3–6 months\n"
-    "4. More than 6 months"
-)
 
-LOCATION_QUESTION = (
-    "3/4. Where is your project located? "
-    "Please reply with city and area."
-)
+def list_reply(message, button, options):
+    return {
+        "type": "list",
+        "body": message,
+        "button": button,
+        "rows": options
+    }
 
-VISIT_QUESTION = (
-    "4/4. When would you prefer a site visit? "
-    "Please type a preferred date/day. "
-    "Our sales team will confirm availability."
-)
+
+STATUS_OPTIONS = [
+    {"id": "status_planning", "title": "Planning"},
+    {"id": "status_construction", "title": "Under construction"},
+    {"id": "status_interiors", "title": "Interiors in progress"},
+    {"id": "status_completed", "title": "Completed"}
+]
+
+TIMELINE_OPTIONS = [
+    {"id": "timeline_1", "title": "Within 1 month"},
+    {"id": "timeline_2", "title": "1-3 months"},
+    {"id": "timeline_3", "title": "3-6 months"},
+    {"id": "timeline_4", "title": "More than 6 months"}
+]
+
+
+def status_question(first=False):
+    intro = (
+        "Welcome to HYTOMA Automation! 👋\n\n"
+        "Thank you for contacting us.\n\n"
+        if first else ""
+    )
+
+    return list_reply(
+        intro + "What is the current status of your project?",
+        "Select Status",
+        STATUS_OPTIONS
+    )
+
+
+def timeline_question():
+    return list_reply(
+        "When do you expect your construction "
+        "or interior work to be completed?",
+        "Select Timeline",
+        TIMELINE_OPTIONS
+    )
+
+
+def location_question():
+    return text_reply(
+        "Could you please share your project location?\n\n"
+        "Please mention your city and area."
+    )
+
+
+def visit_question():
+    return text_reply(
+        "When would you prefer a site visit "
+        "from our HYTOMA team?\n\n"
+        "Please share your preferred date or day. "
+        "Our team will confirm availability."
+    )
+
 
 FINAL_MESSAGE = (
-    "Thank you! ✅ HYTOMA has received your project details. "
-    "Our team will review them and contact you for the next steps. "
-    "Your preferred site visit is not yet confirmed."
+    "Thank you for sharing your details with "
+    "HYTOMA Automation! ✅\n\n"
+    "Our team will review your project information "
+    "and contact you to discuss the next steps.\n\n"
+    "Your site visit is not yet confirmed."
+)
+
+LATER_MESSAGE = (
+    "Thank you for sharing your project details "
+    "with HYTOMA Automation! 😊\n\n"
+    "Since your project is still in progress, "
+    "you can contact us when you're closer to "
+    "completing the work.\n\n"
+    "We'll be happy to assist you with your "
+    "automation requirements."
 )
 
 HUMAN_MESSAGE = (
-    "Sure. I've forwarded this conversation "
-    "for HYTOMA team review."
+    "Sure! Our HYTOMA team will review "
+    "your enquiry and assist you."
 )
 
-STATUS_VALUES = {
+
+STATUS_MAP = {
+    "status_planning": "planning",
     "1": "planning",
     "planning": "planning",
-    "plan": "planning",
 
+    "status_construction": "construction",
     "2": "construction",
-    "construction": "construction",
     "under construction": "construction",
+    "construction": "construction",
 
+    "status_interiors": "interiors",
     "3": "interiors",
     "interiors": "interiors",
-    "interior": "interiors",
     "interiors in progress": "interiors",
     "interior work": "interiors",
 
+    "status_completed": "completed",
     "4": "completed",
-    "completed": "completed",
-    "ready": "completed",
+    "completed": "completed"
 }
 
-TIMELINE_VALUES = {
+TIMELINE_MAP = {
+    "timeline_1": "Within 1 month",
     "1": "Within 1 month",
     "within 1 month": "Within 1 month",
 
-    "2": "1–3 months",
-    "1-3 months": "1–3 months",
-    "1–3 months": "1–3 months",
+    "timeline_2": "1-3 months",
+    "2": "1-3 months",
+    "1-3 months": "1-3 months",
+    "1–3 months": "1-3 months",
 
-    "3": "3–6 months",
-    "3-6 months": "3–6 months",
-    "3–6 months": "3–6 months",
+    "timeline_3": "3-6 months",
+    "3": "3-6 months",
+    "3-6 months": "3-6 months",
+    "3–6 months": "3-6 months",
 
+    "timeline_4": "More than 6 months",
     "4": "More than 6 months",
-    "more than 6 months": "More than 6 months",
+    "more than 6 months": "More than 6 months"
 }
 
 
-def normalize_status(value: str):
-    return STATUS_VALUES.get(value.strip().lower())
+def decide_next(lead, user_text):
+    """
+    Returns:
+        updated_lead, response
 
+    response is a dict containing:
+        type: text or list
+        body: message content
+        button/rows: list message options
+    """
 
-def normalize_timeline(value: str):
-    return TIMELINE_VALUES.get(value.strip().lower())
-
-
-def decide_next(
-    lead: dict | None,
-    user_text: str
-) -> tuple[dict, str | None]:
-
-    # First message starts qualification.
+    # New conversation
     if lead is None:
         return {
             "step": "status",
@@ -103,102 +157,105 @@ def decide_next(
             "project_status": None,
             "completion_timeline": None,
             "project_location": None,
-            "preferred_site_visit": None,
-        }, INTRO + STATUS_QUESTION
+            "preferred_site_visit": None
+        }, status_question(first=True)
 
     data = dict(lead)
 
-    # Do not restart completed conversations.
+    # Completed/deferred/human conversations
+    # should not restart automatically.
     if data["status"] != "screening":
         return data, None
 
     answer = (user_text or "").strip()
+    normalized = answer.casefold()
 
-    if answer.casefold() in {
-        "stop", "unsubscribe", "opt out"
+    # Customer opt-out
+    if normalized in {
+        "stop",
+        "unsubscribe",
+        "opt out"
     }:
-        data.update(
-            step="closed",
-            status="opted_out"
-        )
+        data["step"] = "closed"
+        data["status"] = "opted_out"
         return data, None
 
-    if answer.casefold() in {
+    # Human requested
+    if normalized in {
         "human",
         "agent",
         "salesperson",
         "talk to person"
     }:
-        data.update(
-            step="closed",
-            status="human"
-        )
-        return data, HUMAN_MESSAGE
+        data["step"] = "closed"
+        data["status"] = "human"
+        return data, text_reply(HUMAN_MESSAGE)
 
     step = data["step"]
 
-    # Question 1 — Project status
+    # Project status
     if step == "status":
-        value = normalize_status(answer)
+
+        value = STATUS_MAP.get(normalized)
 
         if not value:
-            return data, (
-                "Please choose 1, 2, 3 or 4.\n\n"
-                + STATUS_QUESTION
-            )
+            return data, status_question()
 
         data["project_status"] = value
 
         if value in {"construction", "interiors"}:
             data["step"] = "timeline"
-            return data, TIMELINE_QUESTION
+            return data, timeline_question()
 
         data["step"] = "location"
-        return data, LOCATION_QUESTION
+        return data, location_question()
 
-    # Question 2 — Completion timeline
+    # Expected completion timeline
     if step == "timeline":
-        value = normalize_timeline(answer)
+
+        value = TIMELINE_MAP.get(normalized)
 
         if not value:
-            return data, (
-                "Please choose a timeline from 1 to 4.\n\n"
-                + TIMELINE_QUESTION
-            )
+            return data, timeline_question()
 
         data["completion_timeline"] = value
+
+        # If work takes more than one month,
+        # don't ask location or site-visit questions.
+        if value != "Within 1 month":
+            data["step"] = "closed"
+            data["status"] = "deferred"
+
+            return data, text_reply(LATER_MESSAGE)
+
         data["step"] = "location"
+        return data, location_question()
 
-        return data, LOCATION_QUESTION
-
-    # Question 3 — Project location
+    # Project location
     if step == "location":
-        if len(answer) < 3 or len(answer) > 200:
-            return data, (
-                "Please enter your city and area "
-                "(for example, Vijayawada, Benz Circle)."
+
+        if not 3 <= len(answer) <= 200:
+            return data, text_reply(
+                "Please share your city and area.\n"
+                "Example: KPHB, Hyderabad."
             )
 
         data["project_location"] = answer
         data["step"] = "visit"
 
-        return data, VISIT_QUESTION
+        return data, visit_question()
 
-    # Question 4 — Preferred site visit
+    # Preferred site visit
     if step == "visit":
-        if len(answer) < 2 or len(answer) > 200:
-            return data, (
-                "Please type your preferred "
-                "site-visit date or day."
-            )
+
+        if not 2 <= len(answer) <= 200:
+            return data, visit_question()
 
         data["preferred_site_visit"] = answer
 
-        data.update(
-            step="closed",
-            status="completed"
-        )
+        data["step"] = "closed"
+        data["status"] = "completed"
 
-        return data, FINAL_MESSAGE
+        return data, text_reply(FINAL_MESSAGE)
 
     return data, None

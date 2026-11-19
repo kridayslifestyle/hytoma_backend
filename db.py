@@ -7,8 +7,7 @@ import psycopg
 
 from psycopg.rows import dict_row
 from qualification import decide_next
-from whatsapp_service import send_whatsapp_text
-
+from whatsapp_service import send_qualification_reply
 logger = logging.getLogger("hytoma")
 
 SCHEMA = """
@@ -213,7 +212,7 @@ def process_next_event():
                         ))
 
                 if response:
-                    send_whatsapp_text(
+                    send_qualification_reply(
                         phone,
                         response
                     )

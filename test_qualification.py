@@ -2,63 +2,110 @@
 from qualification import decide_next
 
 
-def test_construction():
+def test_one_month_flow():
+
     lead, reply = decide_next(None, "Hi")
 
     assert lead["step"] == "status"
-    assert "project status" in reply
+    assert reply["type"] == "list"
+    assert "1/4" not in reply["body"]
 
-    lead, reply = decide_next(lead, "2")
+    lead, reply = decide_next(
+        lead,
+        "status_construction"
+    )
+
     assert lead["step"] == "timeline"
+    assert reply["type"] == "list"
 
-    lead, reply = decide_next(lead, "2")
+    lead, reply = decide_next(
+        lead,
+        "timeline_1"
+    )
+
     assert lead["step"] == "location"
 
     lead, reply = decide_next(
         lead,
-        "Bhimavaram, AP"
+        "KPHB, Hyderabad"
     )
+
     assert lead["step"] == "visit"
 
     lead, reply = decide_next(
         lead,
-        "Saturday afternoon"
+        "This Saturday"
     )
 
     assert lead["status"] == "completed"
-    assert "not yet confirmed" in reply
-
-    updated, reply = decide_next(
-        lead,
-        "New lock available?"
-    )
-
-    assert updated == lead
-    assert reply is None
+    assert reply["type"] == "text"
 
 
-def test_skip_timeline():
-    lead, _ = decide_next(None, "Hi")
+def test_deferred_flow():
 
-    lead, reply = decide_next(lead, "4")
+    for option in [
+        "timeline_2",
+        "timeline_3",
+        "timeline_4"
+    ]:
 
-    assert lead["step"] == "location"
-    assert lead["completion_timeline"] is None
+        lead, _ = decide_next(None, "Hi")
+
+        lead, _ = decide_next(
+            lead,
+            "status_interiors"
+        )
+
+        lead, reply = decide_next(
+            lead,
+            option
+        )
+
+        assert lead["status"] == "deferred"
+        assert lead["step"] == "closed"
+        assert lead["project_location"] is None
+        assert lead["preferred_site_visit"] is None
+
+        assert reply["type"] == "text"
+        assert "Thank you" in reply["body"]
+
+        # No automatic restart
+        lead, reply = decide_next(
+            lead,
+            "Hi again"
+        )
+
+        assert reply is None
 
 
-def test_invalid_option():
+def test_completed_project():
+
     lead, _ = decide_next(None, "Hi")
 
     lead, reply = decide_next(
         lead,
-        "unknown"
+        "status_completed"
+    )
+
+    assert lead["step"] == "location"
+    assert reply["type"] == "text"
+
+
+def test_invalid_option():
+
+    lead, _ = decide_next(None, "Hi")
+
+    lead, reply = decide_next(
+        lead,
+        "invalid"
     )
 
     assert lead["step"] == "status"
-    assert "Please choose" in reply
+    assert reply["type"] == "list"
 
 
 def test_human():
+
     lead, _ = decide_next(None, "Hi")
 
     lead, reply = decide_next(
@@ -67,13 +114,15 @@ def test_human():
     )
 
     assert lead["status"] == "human"
-    assert "HYTOMA" in reply
+    assert reply["type"] == "text"
 
 
 if __name__ == "__main__":
-    test_construction()
-    test_skip_timeline()
+
+    test_one_month_flow()
+    test_deferred_flow()
+    test_completed_project()
     test_invalid_option()
     test_human()
 
-    print("All qualification tests passed")
+    print("All updated qualification tests passed")
