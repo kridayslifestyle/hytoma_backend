@@ -1,69 +1,61 @@
 
+"""Official Meta WhatsApp Cloud API sender."""
+
 import os
 import requests
 
-from dotenv import load_dotenv
 
-load_dotenv()
+def send_whatsapp_payload(payload: dict) -> dict:
 
-ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
-API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v27.0")
+    token = os.environ.get(
+        "WHATSAPP_ACCESS_TOKEN", ""
+    )
 
+    number_id = os.environ.get(
+        "WHATSAPP_PHONE_NUMBER_ID", ""
+    )
 
-def send_whatsapp_payload(payload):
-    if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
+    version = os.environ.get(
+        "WHATSAPP_API_VERSION", "v27.0"
+    )
+
+    if not token or not number_id:
         raise RuntimeError(
-            "WhatsApp API credentials are missing."
+            "WhatsApp sender credentials are not configured"
         )
 
     url = (
         f"https://graph.facebook.com/"
-        f"{API_VERSION}/{PHONE_NUMBER_ID}/messages"
+        f"{version}/{number_id}/messages"
     )
-
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
 
     response = requests.post(
         url,
-        headers=headers,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        },
         json=payload,
         timeout=20
     )
 
     response.raise_for_status()
+
     return response.json()
 
 
-def send_whatsapp_text(phone, message):
-    payload = {
+def send_whatsapp_text(
+    phone: str,
+    text: str
+) -> dict:
+
+    return send_whatsapp_payload({
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
         "to": phone,
         "type": "text",
         "text": {
             "preview_url": False,
-            "body": message
+            "body": text
         }
-    }
-
-    return send_whatsapp_payload(payload)
-
-
-def send_hello_world_template(phone):
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "template",
-        "template": {
-            "name": "hello_world",
-            "language": {
-                "code": "en_US"
-            }
-        }
-    }
-
-    return send_whatsapp_payload(payload)
+    })
