@@ -6,7 +6,7 @@ import hashlib
 import logging
 import secrets
 import asyncio
-
+import sys
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
@@ -27,7 +27,14 @@ from db import (
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ],
+    force=True
+)
 
 logger = logging.getLogger("hytoma")
 
