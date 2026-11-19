@@ -203,12 +203,19 @@ def decide_next(lead, user_text):
 
         data["project_status"] = value
 
+        
         if value in {"construction", "interiors"}:
             data["step"] = "timeline"
             return data, timeline_question()
 
+        if value == "planning":
+            data["step"] = "planning_location"
+            return data, location_question()
+
+# Completed projects
         data["step"] = "location"
         return data, location_question()
+
 
     # Expected completion timeline
     if step == "timeline":
@@ -230,6 +237,31 @@ def decide_next(lead, user_text):
 
         data["step"] = "location"
         return data, location_question()
+
+    
+# Planning project — collect location only
+    if step == "planning_location":
+
+        if not 3 <= len(answer) <= 200:
+            return data, text_reply(
+                "Please share your city and area.\n"
+                "Example: KPHB, Hyderabad."
+            )
+
+        data["project_location"] = answer
+        data["step"] = "closed"
+        data["status"] = "deferred"
+
+        return data, text_reply(
+            "Thank you for sharing your project details "
+            "with HYTOMA Automation! 😊\n\n"
+            "Since your project is currently in the "
+            "planning stage, our team will be happy "
+            "to assist you when you're ready to "
+            "proceed with automation.\n\n"
+            "Feel free to contact us anytime!"
+        )
+
 
     # Project location
     if step == "location":
