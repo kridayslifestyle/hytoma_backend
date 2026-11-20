@@ -3,52 +3,55 @@
 import os
 import requests
 from dotenv import load_dotenv
+import os
+import logging
+import requests
 
+logger = logging.getLogger("hytoma")
 load_dotenv()
+
 
 
 def send_whatsapp_payload(payload):
 
     access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
-
     phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
-
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v27.0")
+    api_version = os.getenv(
+        "WHATSAPP_API_VERSION", "v27.0"
+    )
 
     if not access_token or not phone_number_id:
-        raise RuntimeError("WhatsApp API credentials are missing")
+        raise RuntimeError(
+            "WhatsApp API credentials are missing"
+        )
 
-    url = f"https://graph.facebook.com/" f"{api_version}/{phone_number_id}/messages"
+    url = (
+        f"https://graph.facebook.com/"
+        f"{api_version}/{phone_number_id}/messages"
+    )
 
     response = requests.post(
         url,
         headers={
             "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
+            "Content-Type": "application/json"
         },
         json=payload,
-        timeout=20,
+        timeout=20
     )
 
-
     if not response.ok:
-        try:
-            error_data = response.json()
-        except ValueError:
-            error_data = {"message": response.text[:500]}
-
-        print(
-            "WHATSAPP API ERROR:",
-            "HTTP status:",
+        logger.error(
+            "WhatsApp API failed: HTTP %s, body=%s",
             response.status_code,
-            "Response:",
-            error_data,
-            flush=True,
+            response.text[:500]
         )
-
         response.raise_for_status()
 
-        return response.json()
+    # CRITICAL: Return Meta's response to caller
+    return response.json()
+
+
 
 
 
@@ -65,8 +68,9 @@ def send_whatsapp_text(phone: str, message: str) -> dict:
         }
     }
 
-    # IMPORTANT: Return Meta's API response
+    # CRITICAL: Return the API result
     return send_whatsapp_payload(payload)
+
 
 
 def send_whatsapp_list(phone, message, button_text, rows):
