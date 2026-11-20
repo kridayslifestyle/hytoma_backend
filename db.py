@@ -165,6 +165,7 @@ def enqueue_event(message_id, phone, message_text, sender_number_id, ad_id):
             return True
 
 
+
 def process_next_event():
     """Process one pending WhatsApp event."""
 
@@ -174,7 +175,9 @@ def process_next_event():
         with db_connect() as conn:
             with conn.cursor() as cur:
 
-                # Get one incoming message
+                # --------------------------------
+                # 1. GET PENDING MESSAGE
+                # --------------------------------
                 cur.execute("""
                     SELECT *
                     FROM inbound_events
@@ -193,109 +196,123 @@ def process_next_event():
                 event_id = event["message_id"]
                 phone = event["phone"]
 
-                # Check whether customer already exists
-                cur.execute(
-                    """
+                # --------------------------------
+                # 2. CHECK EXISTING CUSTOMER
+                # --------------------------------
+                cur.execute("""
                     SELECT *
                     FROM leads
                     WHERE phone = %s
                     FOR UPDATE
-                """,
-                    (phone,),
-                )
+                """, (phone,))
 
                 lead = cur.fetchone()
                 response = None
 
                 # --------------------------------
-                # A. RETURNING CUSTOMER
+                # 3. RETURNING CUSTOMER HANDLING
                 # --------------------------------
-                if lead is not None and lead["status"] in {"completed", "deferred"}:
+                if (
+                    lead is not None
+                    and lead["status"] in {
+                        "completed",
+                        "deferred"
+                    }
+                ):
 
                     now = datetime.now(timezone.utc)
 
-                    last_message = lead.get("last_return_message_at")
-
-                    # New session after 24 hours
-                    # without returning-customer activity.
-                    should_acknowledge = (
-                        last_message is None
-                        or now - last_message >= timedelta(hours=24)
+                    last_message = lead.get(
+                        "last_return_message_at"
                     )
 
-                    # Flag for admin review on EVERY
-                    # returning-customer message.
-                    cur.execute(
-                        """
+                    # Only acknowledge after 24 hours
+                    # of inactivity, or on first return.
+                    should_acknowledge = (
+                        last_message is None
+                        or now - last_message
+                        >= timedelta(hours=24)
+                    )
+
+                    # Flag customer for admin attention
+                    cur.execute("""
                         UPDATE leads
                         SET
                             last_return_message_at = NOW(),
                             needs_admin_followup = TRUE,
                             updated_at = NOW()
                         WHERE phone = %s
-                    """,
-                        (phone,),
-                    )
+                    """, (phone,))
 
                     if should_acknowledge:
 
-                        response = text_reply(RETURNING_CUSTOMER_MESSAGE)
+                        response = text_reply(
+                            RETURNING_CUSTOMER_MESSAGE
+                        )
 
-                        cur.execute(
-                            """
+                        cur.execute("""
                             UPDATE leads
                             SET
                                 return_acknowledged_at = NOW()
                             WHERE phone = %s
-                        """,
-                            (phone,),
-                        )
+                        """, (phone,))
 
                     logger.info(
-                        "Returning customer activity: " "last4=%s acknowledgement=%s",
+                        "Returning customer activity: "
+                        "last4=%s acknowledgement=%s",
                         phone[-4:],
-                        should_acknowledge,
+                        should_acknowledge
                     )
 
                 # --------------------------------
-                # B. NEW CUSTOMER / SCREENING
+                # 4. NEW CUSTOMER / SCREENING
                 # --------------------------------
                 else:
 
                     is_ad = bool(event["ad_id"])
 
                     ad_only = (
-                        os.environ.get("QUALIFY_ONLY_AD_LEADS", "false").lower()
-                        == "true"
+                        os.environ.get(
+                            "QUALIFY_ONLY_AD_LEADS",
+                            "false"
+                        ).lower() == "true"
                     )
 
-                    # New contact not from an ad
-                    # when ad-only screening enabled
-                    if lead is None and ad_only and not is_ad:
+                    # New non-ad customer:
+                    # send to admin if ad-only enabled
+                    if (
+                        lead is None
+                        and ad_only
+                        and not is_ad
+                    ):
 
-                        cur.execute(
-                            """
+                        cur.execute("""
                             INSERT INTO leads
-                            (phone, step, status,
-                             needs_admin_followup)
+                            (
+                                phone,
+                                step,
+                                status,
+                                needs_admin_followup
+                            )
                             VALUES (
                                 %s,
                                 'closed',
                                 'human',
                                 TRUE
                             )
-                        """,
-                            (phone,),
-                        )
+                        """, (phone,))
 
                     else:
 
-                        updated, response = decide_next(lead, event["message_text"])
+                        updated, response = decide_next(
+                            lead,
+                            event["message_text"]
+                        )
 
+                        # Create new lead
                         if lead is None:
 
-                            cur.execute(
-                                """
+                            cur.execute("""
                                 INSERT INTO leads (
                                     phone,
                                     step,
@@ -311,23 +328,21 @@ def process_next_event():
                                     %s, %s, %s, %s, %s,
                                     %s, %s, %s, FALSE
                                 )
-                            """,
-                                (
-                                    phone,
-                                    updated["step"],
-                                    updated["status"],
-                                    updated["project_status"],
-                                    updated["completion_timeline"],
-                                    updated["project_location"],
-                                    updated["preferred_site_visit"],
-                                    event["ad_id"],
-                                ),
-                            )
+                            """, (
+                                phone,
+                                updated["step"],
+                                updated["status"],
+                                updated["project_status"],
+                                updated["completion_timeline"],
+                                updated["project_location"],
+                                updated["preferred_site_visit"],
+                                event["ad_id"]
+                            ))
 
+                        # Update existing lead
                         else:
 
-                            cur.execute(
-                                """
+                            cur.execute("""
                                 UPDATE leads
                                 SET
                                     step = %s,
@@ -341,98 +356,116 @@ def process_next_event():
                                     ),
                                     updated_at = NOW()
                                 WHERE phone = %s
-                            """,
-                                (
-                                    updated["step"],
-                                    updated["status"],
-                                    updated["project_status"],
-                                    updated["completion_timeline"],
-                                    updated["project_location"],
-                                    updated["preferred_site_visit"],
-                                    event["ad_id"],
-                                    phone,
-                                ),
-                            )
+                            """, (
+                                updated["step"],
+                                updated["status"],
+                                updated["project_status"],
+                                updated["completion_timeline"],
+                                updated["project_location"],
+                                updated["preferred_site_visit"],
+                                event["ad_id"],
+                                phone
+                            ))
 
-                            # Completed/human enquiries
-                            # can be reviewed by admin.
-                            if updated["status"] in {"completed", "human"}:
-                                cur.execute(
-                                    """
+                            # Notify admin after qualification
+                            # or customer requests a human
+                            if updated["status"] in {
+                                "completed",
+                                "human"
+                            }:
+
+                                cur.execute("""
                                     UPDATE leads
-                                    SET needs_admin_followup = TRUE
+                                    SET
+                                        needs_admin_followup = TRUE
                                     WHERE phone = %s
-                                """,
-                                    (phone,),
-                                )
+                                """, (phone,))
 
                 # --------------------------------
-                # C. SEND RESPONSE IF REQUIRED
+                # 5. SEND AND SAVE BOT RESPONSE
                 # --------------------------------
-                
-                if response:
+                # IMPORTANT:
+                # Everything involving result must
+                # remain inside this condition.
+
+                if response is not None:
+
                     result = send_qualification_reply(
-                    phone,
-                    response
-                )
+                        phone,
+                        response
+                    )
 
-                outgoing_id = (
-                    result.get("messages", [{}])[0].get("id")
-                    if isinstance(result, dict)
-                    else None
-                )
+                    outgoing_id = None
+
+                    if isinstance(result, dict):
+                        messages = result.get("messages") or []
+
+                        if messages:
+                            outgoing_id = messages[0].get("id")
+
+                    # Save outgoing response to chat history
+                    cur.execute("""
+                        INSERT INTO chat_messages
+                        (
+                            phone,
+                            whatsapp_message_id,
+                            direction,
+                            message_type,
+                            content
+                        )
+                        VALUES (
+                            %s,
+                            %s,
+                            'outgoing',
+                            %s,
+                            %s
+                        )
+                        ON CONFLICT (whatsapp_message_id)
+                        DO NOTHING
+                    """, (
+                        phone,
+                        outgoing_id,
+                        response["type"],
+                        response["body"]
+                    ))
+
+                # --------------------------------
+                # 6. MARK INCOMING EVENT PROCESSED
+                # --------------------------------
+                # Must execute even when response is None.
 
                 cur.execute("""
-                    INSERT INTO chat_messages
-                    (
-                        phone,
-                        whatsapp_message_id,
-                        direction,
-                        message_type,
-                        content
-                    )
-                    VALUES (%s, %s, 'outgoing', %s, %s)
-                    ON CONFLICT (whatsapp_message_id)
-                    DO NOTHING
-                """, (
-                    phone,
-                    outgoing_id,
-                    response["type"],
-                    response["body"]
-                ))
-
-
-                # --------------------------------
-                # D. MARK EVENT AS PROCESSED
-                # --------------------------------
-                cur.execute(
-                    """
                     UPDATE inbound_events
                     SET
                         state = 'processed',
                         processed_at = NOW(),
                         error_summary = NULL
                     WHERE message_id = %s
-                """,
-                    (event_id,),
-                )
+                """, (event_id,))
 
-                logger.info("Processed WhatsApp message %s", event_id)
+                logger.info(
+                    "Processed WhatsApp message %s",
+                    event_id
+                )
 
                 return True
 
-    except Exception as exc:
+    # --------------------------------
+    # 7. ERROR HANDLING AND RETRIES
+    # --------------------------------
+    except Exception:
 
-        logger.error(
-            "Processing failed for message %s: %s", event_id, type(exc).__name__
+        logger.exception(
+            "Processing failed for message %s",
+            event_id
         )
 
         if event_id:
             try:
                 with db_connect() as conn:
                     with conn.cursor() as cur:
-                        cur.execute(
-                            """
+
+                        cur.execute("""
                             UPDATE inbound_events
                             SET
                                 attempts = attempts + 1,
@@ -450,11 +483,14 @@ def process_next_event():
                                     ),
                                 error_summary = %s
                             WHERE message_id = %s
-                        """,
-                            (type(exc).__name__, event_id),
-                        )
+                        """, (
+                            "ProcessingError",
+                            event_id
+                        ))
 
             except Exception:
-                logger.exception("Unable to record processing failure")
+                logger.exception(
+                    "Unable to record processing failure"
+                )
 
         return False
