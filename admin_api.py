@@ -556,7 +556,25 @@ def admin_send_reply(
                     )
                 )
 
+            
+            # Validate Meta's API response
+            if not isinstance(result, dict):
+                logger.error(
+                    "WhatsApp send returned no API response; "
+                    "delivery may already have succeeded."
+                )
+
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "WhatsApp message may have been sent, "
+                        "but no response was returned. "
+                        "Check WhatsApp before retrying."
+                    )
+                )
+
             messages = result.get("messages") or []
+
 
             message_id = (
                 messages[0].get("id")

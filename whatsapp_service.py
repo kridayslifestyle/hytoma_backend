@@ -51,17 +51,22 @@ def send_whatsapp_payload(payload):
         return response.json()
 
 
-def send_whatsapp_text(phone, message):
 
-    return send_whatsapp_payload(
-        {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": phone,
-            "type": "text",
-            "text": {"preview_url": False, "body": message},
+def send_whatsapp_text(phone: str, message: str) -> dict:
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": message
         }
-    )
+    }
+
+    # IMPORTANT: Return Meta's API response
+    return send_whatsapp_payload(payload)
 
 
 def send_whatsapp_list(phone, message, button_text, rows):
