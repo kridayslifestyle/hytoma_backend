@@ -18,7 +18,7 @@ from db import db_connect
 from datetime import datetime, timedelta, timezone
 import re
 import requests
-
+from auth import require_admin
 from whatsapp_service import send_whatsapp_text
 
 
@@ -32,27 +32,7 @@ router = APIRouter(
     tags=["HYTOMA Admin"]
 )
 
-security = HTTPBearer()
 
-
-def require_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
-    expected_key = os.getenv("ADMIN_API_KEY", "")
-
-    if (
-        not expected_key
-        or not secrets.compare_digest(
-            credentials.credentials,
-            expected_key
-        )
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized"
-        )
-
-    return True
 
 
 class AssignmentUpdate(BaseModel):

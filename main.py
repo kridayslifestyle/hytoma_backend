@@ -9,6 +9,7 @@ import asyncio
 import sys
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from auth import router as auth_router
 
 from fastapi import (
     FastAPI,
@@ -107,6 +108,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.include_router(auth_router)
 app.include_router(admin_router)
 
 

@@ -111,6 +111,25 @@ TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS inbound_events_phone_created_idx
 ON inbound_events (phone, created_at DESC);
 
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    csrf_hash TEXT NOT NULL,
+    username TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS admin_sessions_expiry_idx
+ON admin_sessions (expires_at);
+
+CREATE TABLE IF NOT EXISTS admin_login_attempts (
+    username TEXT PRIMARY KEY,
+    failures INTEGER NOT NULL DEFAULT 0,
+    locked_until TIMESTAMPTZ
+);
+
+
 """
 
 
