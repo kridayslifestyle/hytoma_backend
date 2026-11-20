@@ -18,7 +18,9 @@ from whatsapp_service import send_qualification_reply
 
 logger = logging.getLogger("hytoma")
 
+
 SCHEMA = """
+-- 1. Main leads table
 CREATE TABLE IF NOT EXISTS leads (
     phone TEXT PRIMARY KEY,
     step TEXT NOT NULL DEFAULT 'status',
@@ -32,10 +34,52 @@ CREATE TABLE IF NOT EXISTS leads (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS
-salespeople_name_unique_idx
+-- 2. Existing lead columns
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS last_return_message_at TIMESTAMPTZ;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS return_acknowledged_at TIMESTAMPTZ;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS needs_admin_followup
+BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS assigned_salesperson TEXT;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS sales_status TEXT
+NOT NULL DEFAULT 'new';
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS admin_notes TEXT;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS bot_paused
+BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS bot_paused_at TIMESTAMPTZ;
+
+
+-- 3. Salesperson directory
+CREATE TABLE IF NOT EXISTS salespeople (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 4. Unique salesperson names
+CREATE UNIQUE INDEX IF NOT EXISTS salespeople_name_unique_idx
 ON salespeople (LOWER(name));
 
+-- 5. Preserve existing salesperson assignments
 INSERT INTO salespeople (name)
 SELECT DISTINCT TRIM(assigned_salesperson)
 FROM leads
@@ -43,6 +87,8 @@ WHERE assigned_salesperson IS NOT NULL
   AND TRIM(assigned_salesperson) <> ''
 ON CONFLICT DO NOTHING;
 
+
+-- 6. Durable inbound webhook queue
 CREATE TABLE IF NOT EXISTS inbound_events (
     message_id TEXT PRIMARY KEY,
     phone TEXT NOT NULL,
@@ -60,21 +106,11 @@ CREATE TABLE IF NOT EXISTS inbound_events (
 CREATE INDEX IF NOT EXISTS inbound_pending_idx
 ON inbound_events (state, retry_after, created_at);
 
-
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS last_return_message_at
-TIMESTAMPTZ;
-
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS return_acknowledged_at
-TIMESTAMPTZ;
-
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS needs_admin_followup
-BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS inbound_events_phone_created_idx
+ON inbound_events (phone, created_at DESC);
 
 
--- Save incoming and outgoing WhatsApp messages
+-- 7. WhatsApp conversation history
 CREATE TABLE IF NOT EXISTS chat_messages (
     id BIGSERIAL PRIMARY KEY,
     phone TEXT NOT NULL,
@@ -89,40 +125,8 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS chat_messages_phone_idx
 ON chat_messages (phone, created_at DESC);
 
--- Manual salesperson assignment
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS assigned_salesperson TEXT;
 
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS sales_status TEXT
-NOT NULL DEFAULT 'new';
-
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS admin_notes TEXT;
-
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ;
-
--- Existing returning-customer flag
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS needs_admin_followup
-BOOLEAN NOT NULL DEFAULT FALSE;
-
-
--- Admin takeover controls
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS bot_paused
-BOOLEAN NOT NULL DEFAULT FALSE;
-
-ALTER TABLE leads
-ADD COLUMN IF NOT EXISTS bot_paused_at
-TIMESTAMPTZ;
-
--- Index for customer-service window lookups
-CREATE INDEX IF NOT EXISTS inbound_events_phone_created_idx
-ON inbound_events (phone, created_at DESC);
-
-
+-- 8. Admin authentication sessions
 CREATE TABLE IF NOT EXISTS admin_sessions (
     token_hash TEXT PRIMARY KEY,
     csrf_hash TEXT NOT NULL,
@@ -139,9 +143,8 @@ CREATE TABLE IF NOT EXISTS admin_login_attempts (
     failures INTEGER NOT NULL DEFAULT 0,
     locked_until TIMESTAMPTZ
 );
-
-
 """
+
 
 
 def db_connect():
