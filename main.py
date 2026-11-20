@@ -19,7 +19,7 @@ from fastapi import (
 )
 
 from fastapi.responses import PlainTextResponse
-
+from sales_management_api import router as sales_management_router
 from admin_api import router as admin_router
 
 from db import (
@@ -110,6 +110,7 @@ app = FastAPI(
 
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(sales_management_router)
 
 
 @app.get("/")
