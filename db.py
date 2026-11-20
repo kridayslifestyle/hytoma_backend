@@ -1,4 +1,3 @@
-
 """PostgreSQL storage and durable inbound webhook queue."""
 
 import os
@@ -8,19 +7,15 @@ import psycopg
 
 from datetime import datetime, timedelta, timezone
 
-from qualification import (
-    decide_next,
-    text_reply,
-    RETURNING_CUSTOMER_MESSAGE
-)
+from qualification import decide_next, text_reply, RETURNING_CUSTOMER_MESSAGE
 
 from whatsapp_service import send_qualification_reply
-
 
 
 from psycopg.rows import dict_row
 from qualification import decide_next
 from whatsapp_service import send_qualification_reply
+
 logger = logging.getLogger("hytoma")
 
 SCHEMA = """
@@ -67,6 +62,42 @@ ALTER TABLE leads
 ADD COLUMN IF NOT EXISTS needs_admin_followup
 BOOLEAN NOT NULL DEFAULT FALSE;
 
+
+-- Save incoming and outgoing WhatsApp messages
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id BIGSERIAL PRIMARY KEY,
+    phone TEXT NOT NULL,
+    whatsapp_message_id TEXT UNIQUE,
+    direction TEXT NOT NULL
+        CHECK (direction IN ('incoming', 'outgoing')),
+    message_type TEXT NOT NULL DEFAULT 'text',
+    content TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS chat_messages_phone_idx
+ON chat_messages (phone, created_at DESC);
+
+-- Manual salesperson assignment
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS assigned_salesperson TEXT;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS sales_status TEXT
+NOT NULL DEFAULT 'new';
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS admin_notes TEXT;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMPTZ;
+
+-- Existing returning-customer flag
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS needs_admin_followup
+BOOLEAN NOT NULL DEFAULT FALSE;
+
+
 """
 
 
@@ -74,15 +105,9 @@ def db_connect():
     url = os.environ.get("DATABASE_URL")
 
     if not url:
-        raise RuntimeError(
-            "DATABASE_URL must be configured"
-        )
+        raise RuntimeError("DATABASE_URL must be configured")
 
-    return psycopg.connect(
-        url,
-        row_factory=dict_row,
-        connect_timeout=10
-    )
+    return psycopg.connect(url, row_factory=dict_row, connect_timeout=10)
 
 
 def initialize_database():
@@ -91,16 +116,12 @@ def initialize_database():
             cur.execute(SCHEMA, prepare=False)
 
 
-def enqueue_event(
-    message_id,
-    phone,
-    message_text,
-    sender_number_id,
-    ad_id
-):
+def enqueue_event(message_id, phone, message_text, sender_number_id, ad_id):
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+
+            cur.execute(
+                """
                 INSERT INTO inbound_events
                 (
                     message_id,
@@ -112,16 +133,36 @@ def enqueue_event(
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (message_id) DO NOTHING
                 RETURNING message_id
-            """, (
-                message_id,
-                phone,
-                message_text,
-                sender_number_id,
-                ad_id
-            ))
+            """,
+                (message_id, phone, message_text, sender_number_id, ad_id),
+            )
 
-            return cur.fetchone() is not None
+            inserted = cur.fetchone() is not None
 
+            if not inserted:
+                return False
+
+            # Preserve message for admin inbox
+            cur.execute(
+                """
+                INSERT INTO chat_messages
+                (
+                    phone,
+                    whatsapp_message_id,
+                    direction,
+                    message_type,
+                    content
+                )
+                VALUES (
+                    %s, %s, 'incoming', 'text', %s
+                )
+                ON CONFLICT (whatsapp_message_id)
+                DO NOTHING
+            """,
+                (phone, message_id, message_text),
+            )
+
+            return True
 
 
 def process_next_event():
@@ -153,12 +194,15 @@ def process_next_event():
                 phone = event["phone"]
 
                 # Check whether customer already exists
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT *
                     FROM leads
                     WHERE phone = %s
                     FOR UPDATE
-                """, (phone,))
+                """,
+                    (phone,),
+                )
 
                 lead = cur.fetchone()
                 response = None
@@ -166,57 +210,51 @@ def process_next_event():
                 # --------------------------------
                 # A. RETURNING CUSTOMER
                 # --------------------------------
-                if (
-                    lead is not None
-                    and lead["status"] in {
-                        "completed",
-                        "deferred"
-                    }
-                ):
+                if lead is not None and lead["status"] in {"completed", "deferred"}:
 
                     now = datetime.now(timezone.utc)
 
-                    last_message = lead.get(
-                        "last_return_message_at"
-                    )
+                    last_message = lead.get("last_return_message_at")
 
                     # New session after 24 hours
                     # without returning-customer activity.
                     should_acknowledge = (
                         last_message is None
-                        or now - last_message
-                        >= timedelta(hours=24)
+                        or now - last_message >= timedelta(hours=24)
                     )
 
                     # Flag for admin review on EVERY
                     # returning-customer message.
-                    cur.execute("""
+                    cur.execute(
+                        """
                         UPDATE leads
                         SET
                             last_return_message_at = NOW(),
                             needs_admin_followup = TRUE,
                             updated_at = NOW()
                         WHERE phone = %s
-                    """, (phone,))
+                    """,
+                        (phone,),
+                    )
 
                     if should_acknowledge:
 
-                        response = text_reply(
-                            RETURNING_CUSTOMER_MESSAGE
-                        )
+                        response = text_reply(RETURNING_CUSTOMER_MESSAGE)
 
-                        cur.execute("""
+                        cur.execute(
+                            """
                             UPDATE leads
                             SET
                                 return_acknowledged_at = NOW()
                             WHERE phone = %s
-                        """, (phone,))
+                        """,
+                            (phone,),
+                        )
 
                     logger.info(
-                        "Returning customer activity: "
-                        "last4=%s acknowledgement=%s",
+                        "Returning customer activity: " "last4=%s acknowledgement=%s",
                         phone[-4:],
-                        should_acknowledge
+                        should_acknowledge,
                     )
 
                 # --------------------------------
@@ -227,21 +265,16 @@ def process_next_event():
                     is_ad = bool(event["ad_id"])
 
                     ad_only = (
-                        os.environ.get(
-                            "QUALIFY_ONLY_AD_LEADS",
-                            "false"
-                        ).lower() == "true"
+                        os.environ.get("QUALIFY_ONLY_AD_LEADS", "false").lower()
+                        == "true"
                     )
 
                     # New contact not from an ad
                     # when ad-only screening enabled
-                    if (
-                        lead is None
-                        and ad_only
-                        and not is_ad
-                    ):
+                    if lead is None and ad_only and not is_ad:
 
-                        cur.execute("""
+                        cur.execute(
+                            """
                             INSERT INTO leads
                             (phone, step, status,
                              needs_admin_followup)
@@ -251,18 +284,18 @@ def process_next_event():
                                 'human',
                                 TRUE
                             )
-                        """, (phone,))
+                        """,
+                            (phone,),
+                        )
 
                     else:
 
-                        updated, response = decide_next(
-                            lead,
-                            event["message_text"]
-                        )
+                        updated, response = decide_next(lead, event["message_text"])
 
                         if lead is None:
 
-                            cur.execute("""
+                            cur.execute(
+                                """
                                 INSERT INTO leads (
                                     phone,
                                     step,
@@ -278,20 +311,23 @@ def process_next_event():
                                     %s, %s, %s, %s, %s,
                                     %s, %s, %s, FALSE
                                 )
-                            """, (
-                                phone,
-                                updated["step"],
-                                updated["status"],
-                                updated["project_status"],
-                                updated["completion_timeline"],
-                                updated["project_location"],
-                                updated["preferred_site_visit"],
-                                event["ad_id"]
-                            ))
+                            """,
+                                (
+                                    phone,
+                                    updated["step"],
+                                    updated["status"],
+                                    updated["project_status"],
+                                    updated["completion_timeline"],
+                                    updated["project_location"],
+                                    updated["preferred_site_visit"],
+                                    event["ad_id"],
+                                ),
+                            )
 
                         else:
 
-                            cur.execute("""
+                            cur.execute(
+                                """
                                 UPDATE leads
                                 SET
                                     step = %s,
@@ -305,70 +341,98 @@ def process_next_event():
                                     ),
                                     updated_at = NOW()
                                 WHERE phone = %s
-                            """, (
-                                updated["step"],
-                                updated["status"],
-                                updated["project_status"],
-                                updated["completion_timeline"],
-                                updated["project_location"],
-                                updated["preferred_site_visit"],
-                                event["ad_id"],
-                                phone
-                            ))
+                            """,
+                                (
+                                    updated["step"],
+                                    updated["status"],
+                                    updated["project_status"],
+                                    updated["completion_timeline"],
+                                    updated["project_location"],
+                                    updated["preferred_site_visit"],
+                                    event["ad_id"],
+                                    phone,
+                                ),
+                            )
 
                             # Completed/human enquiries
                             # can be reviewed by admin.
-                            if updated["status"] in {
-                                "completed",
-                                "human"
-                            }:
-                                cur.execute("""
+                            if updated["status"] in {"completed", "human"}:
+                                cur.execute(
+                                    """
                                     UPDATE leads
                                     SET needs_admin_followup = TRUE
                                     WHERE phone = %s
-                                """, (phone,))
+                                """,
+                                    (phone,),
+                                )
 
                 # --------------------------------
                 # C. SEND RESPONSE IF REQUIRED
                 # --------------------------------
+                
                 if response:
-                    send_qualification_reply(
+                    result = send_qualification_reply(
+                    phone,
+                    response
+                )
+
+                outgoing_id = (
+                    result.get("messages", [{}])[0].get("id")
+                    if isinstance(result, dict)
+                    else None
+                )
+
+                cur.execute("""
+                    INSERT INTO chat_messages
+                    (
                         phone,
-                        response
+                        whatsapp_message_id,
+                        direction,
+                        message_type,
+                        content
                     )
+                    VALUES (%s, %s, 'outgoing', %s, %s)
+                    ON CONFLICT (whatsapp_message_id)
+                    DO NOTHING
+                """, (
+                    phone,
+                    outgoing_id,
+                    response["type"],
+                    response["body"]
+                ))
+
 
                 # --------------------------------
                 # D. MARK EVENT AS PROCESSED
                 # --------------------------------
-                cur.execute("""
+                cur.execute(
+                    """
                     UPDATE inbound_events
                     SET
                         state = 'processed',
                         processed_at = NOW(),
                         error_summary = NULL
                     WHERE message_id = %s
-                """, (event_id,))
-
-                logger.info(
-                    "Processed WhatsApp message %s",
-                    event_id
+                """,
+                    (event_id,),
                 )
+
+                logger.info("Processed WhatsApp message %s", event_id)
 
                 return True
 
     except Exception as exc:
 
         logger.error(
-            "Processing failed for message %s: %s",
-            event_id,
-            type(exc).__name__
+            "Processing failed for message %s: %s", event_id, type(exc).__name__
         )
 
         if event_id:
             try:
                 with db_connect() as conn:
                     with conn.cursor() as cur:
-                        cur.execute("""
+                        cur.execute(
+                            """
                             UPDATE inbound_events
                             SET
                                 attempts = attempts + 1,
@@ -386,14 +450,11 @@ def process_next_event():
                                     ),
                                 error_summary = %s
                             WHERE message_id = %s
-                        """, (
-                            type(exc).__name__,
-                            event_id
-                        ))
+                        """,
+                            (type(exc).__name__, event_id),
+                        )
 
             except Exception:
-                logger.exception(
-                    "Unable to record processing failure"
-                )
+                logger.exception("Unable to record processing failure")
 
         return False

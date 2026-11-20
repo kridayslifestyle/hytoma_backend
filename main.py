@@ -19,11 +19,16 @@ from fastapi import (
 
 from fastapi.responses import PlainTextResponse
 
+from admin_api import router as admin_router
+
 from db import (
     initialize_database,
     enqueue_event,
     process_next_event
 )
+
+
+
 
 load_dotenv()
 
@@ -102,6 +107,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.include_router(admin_router)
 
 @app.get("/")
 def home():
