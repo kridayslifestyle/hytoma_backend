@@ -98,6 +98,19 @@ ADD COLUMN IF NOT EXISTS needs_admin_followup
 BOOLEAN NOT NULL DEFAULT FALSE;
 
 
+-- Admin takeover controls
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS bot_paused
+BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS bot_paused_at
+TIMESTAMPTZ;
+
+-- Index for customer-service window lookups
+CREATE INDEX IF NOT EXISTS inbound_events_phone_created_idx
+ON inbound_events (phone, created_at DESC);
+
 """
 
 
@@ -208,6 +221,40 @@ def process_next_event():
 
                 lead = cur.fetchone()
                 response = None
+
+
+            
+                # Admin takeover: never send bot replies
+                # while the conversation is paused.
+                if (
+                    lead is not None
+                    and lead.get("bot_paused", False)
+                ):
+                    cur.execute("""
+                        UPDATE leads
+                        SET
+                            needs_admin_followup = TRUE,
+                            updated_at = NOW()
+                        WHERE phone = %s
+                    """, (phone,))
+
+                    cur.execute("""
+                        UPDATE inbound_events
+                        SET
+                            state = 'processed',
+                            processed_at = NOW(),
+                            error_summary = NULL
+                        WHERE message_id = %s
+                    """, (event_id,))
+
+                    logger.info(
+                        "Admin takeover: message stored "
+                        "without bot reply, last4=%s",
+                        phone[-4:]
+                    )
+
+                    return True
+
 
                 # --------------------------------
                 # 3. RETURNING CUSTOMER HANDLING
