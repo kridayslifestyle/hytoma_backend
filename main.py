@@ -109,6 +109,7 @@ app = FastAPI(
 
 app.include_router(admin_router)
 
+
 @app.get("/")
 def home():
     return {
