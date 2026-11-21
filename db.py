@@ -143,8 +143,25 @@ CREATE TABLE IF NOT EXISTS admin_login_attempts (
     failures INTEGER NOT NULL DEFAULT 0,
     locked_until TIMESTAMPTZ
 );
-"""
 
+
+-- Admin outbound WhatsApp request tracking
+CREATE TABLE IF NOT EXISTS outbound_requests (
+    request_id UUID PRIMARY KEY,
+    phone TEXT NOT NULL,
+    message_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'sending'
+        CHECK (status IN ('sending', 'accepted', 'unknown')),
+    whatsapp_message_id TEXT UNIQUE,
+    error_summary TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS outbound_requests_phone_idx
+ON outbound_requests (phone, created_at DESC);
+
+"""
 
 
 def db_connect():

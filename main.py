@@ -21,6 +21,7 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse
 from sales_management_api import router as sales_management_router
 from admin_api import router as admin_router
+from safe_reply_api import router as safe_reply_router
 
 from db import (
     initialize_database,
@@ -112,6 +113,7 @@ app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(sales_management_router)
 app.include_router(inbox_router)
+app.include_router(safe_reply_router)
 
 
 @app.get("/")
