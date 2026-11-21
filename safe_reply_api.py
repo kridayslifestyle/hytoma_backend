@@ -313,3 +313,90 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
         "already_processed": False,
         "bot_paused": True,
     }
+
+
+@router.get("/outbound-requests/{request_id}")
+def get_outbound_request_status(request_id: UUID):
+    """
+    Read an outbound request without retrying it.
+    This endpoint never sends WhatsApp messages.
+    """
+
+    with db_connect() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                    request_id,
+                    phone,
+                    status,
+                    whatsapp_message_id,
+                    created_at,
+                    updated_at
+                FROM outbound_requests
+                WHERE request_id = %s
+                """,
+                (request_id,),
+            )
+
+            request_record = cur.fetchone()
+
+            if request_record is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Outbound request not found",
+                )
+
+            message_id = request_record[
+                "whatsapp_message_id"
+            ]
+
+            delivery_status = None
+            saved_in_chat = False
+
+            if message_id:
+                cur.execute(
+                    """
+                    SELECT delivery_status
+                    FROM whatsapp_message_statuses
+                    WHERE whatsapp_message_id = %s
+                    """,
+                    (message_id,),
+                )
+
+                delivery = cur.fetchone()
+
+                if delivery:
+                    delivery_status = delivery[
+                        "delivery_status"
+                    ]
+
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM chat_messages
+                        WHERE whatsapp_message_id = %s
+                          AND direction = 'outgoing'
+                    ) AS exists_in_chat
+                    """,
+                    (message_id,),
+                )
+
+                saved_in_chat = cur.fetchone()[
+                    "exists_in_chat"
+                ]
+
+    return {
+        "request_id": str(
+            request_record["request_id"]
+        ),
+        "phone": request_record["phone"],
+        "status": request_record["status"],
+        "whatsapp_message_id": message_id,
+        "delivery_status": delivery_status,
+        "saved_in_chat": saved_in_chat,
+        "created_at": request_record["created_at"],
+        "updated_at": request_record["updated_at"],
+    }
+
