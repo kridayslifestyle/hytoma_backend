@@ -1,15 +1,9 @@
-
 """HYTOMA admin lead management API."""
 
 import os
 import secrets
 
-from fastapi import (
-    APIRouter,
-    Depends,
-    HTTPException,
-    Query
-)
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
@@ -27,19 +21,11 @@ import logging
 logger = logging.getLogger("hytoma")
 
 
-router = APIRouter(
-    prefix="/admin",
-    tags=["HYTOMA Admin"]
-)
-
-
+router = APIRouter(prefix="/admin", tags=["HYTOMA Admin"])
 
 
 class AssignmentUpdate(BaseModel):
-    salesperson: str = Field(
-        min_length=1,
-        max_length=100
-    )
+    salesperson: str = Field(min_length=1, max_length=100)
 
     sales_status: str = "assigned"
 
@@ -54,15 +40,12 @@ ALLOWED_SALES_STATUSES = {
     "contacted",
     "visit_scheduled",
     "closed",
-    "not_interested"
+    "not_interested",
 }
 
 
 # Dashboard counts
-@router.get(
-    "/stats",
-    dependencies=[Depends(require_admin)]
-)
+@router.get("/stats", dependencies=[Depends(require_admin)])
 def get_stats():
 
     with db_connect() as conn:
@@ -94,19 +77,16 @@ def get_stats():
 
 
 # List leads
-@router.get(
-    "/leads",
-    dependencies=[Depends(require_admin)]
-)
+@router.get("/leads", dependencies=[Depends(require_admin)])
 def get_leads(
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0)
+    limit: int = Query(default=50, ge=1, le=100), offset: int = Query(default=0, ge=0)
 ):
 
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT
                     phone,
                     status,
@@ -125,56 +105,51 @@ def get_leads(
                 FROM leads
                 ORDER BY updated_at DESC
                 LIMIT %s OFFSET %s
-            """, (limit, offset))
+            """,
+                (limit, offset),
+            )
 
-            return {
-                "leads": cur.fetchall()
-            }
+            return {"leads": cur.fetchall()}
 
 
 # Individual lead details
-@router.get(
-    "/leads/{phone}",
-    dependencies=[Depends(require_admin)]
-)
+@router.get("/leads/{phone}", dependencies=[Depends(require_admin)])
 def get_lead(phone: str):
 
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT *
                 FROM leads
                 WHERE phone = %s
-            """, (phone,))
+            """,
+                (phone,),
+            )
 
             lead = cur.fetchone()
 
             if not lead:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Lead not found"
-                )
+                raise HTTPException(status_code=404, detail="Lead not found")
 
             return lead
 
 
 # Chat history
-@router.get(
-    "/leads/{phone}/messages",
-    dependencies=[Depends(require_admin)]
-)
-def get_messages(
-    phone: str,
-    limit: int = Query(default=100, ge=1, le=200)
-):
+
+
+@router.get("/leads/{phone}/messages", dependencies=[Depends(require_admin)])
+def get_messages(phone: str, limit: int = Query(default=100, ge=1, le=200)):
 
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT
                     id,
+                    whatsapp_message_id,
                     direction,
                     message_type,
                     content,
@@ -187,34 +162,25 @@ def get_messages(
                     LIMIT %s
                 ) AS recent
                 ORDER BY created_at ASC, id ASC
-            """, (phone, limit))
+            """,
+                (phone, limit),
+            )
 
-            return {
-                "phone": phone,
-                "messages": cur.fetchall()
-            }
+            return {"phone": phone, "messages": cur.fetchall()}
 
 
 # Assign lead to salesperson
-@router.patch(
-    "/leads/{phone}/assign",
-    dependencies=[Depends(require_admin)]
-)
-def assign_lead(
-    phone: str,
-    payload: AssignmentUpdate
-):
+@router.patch("/leads/{phone}/assign", dependencies=[Depends(require_admin)])
+def assign_lead(phone: str, payload: AssignmentUpdate):
 
     if payload.sales_status not in ALLOWED_SALES_STATUSES:
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid sales status"
-        )
+        raise HTTPException(status_code=422, detail="Invalid sales status")
 
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE leads
                 SET
                     assigned_salesperson = %s,
@@ -227,67 +193,54 @@ def assign_lead(
                     assigned_salesperson,
                     sales_status,
                     assigned_at
-            """, (
-                payload.salesperson,
-                payload.sales_status,
-                phone
-            ))
+            """,
+                (payload.salesperson, payload.sales_status, phone),
+            )
 
             result = cur.fetchone()
 
             if not result:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Lead not found"
-                )
+                raise HTTPException(status_code=404, detail="Lead not found")
 
             return result
 
 
 # Update admin notes
-@router.patch(
-    "/leads/{phone}/notes",
-    dependencies=[Depends(require_admin)]
-)
-def update_notes(
-    phone: str,
-    payload: NotesUpdate
-):
+@router.patch("/leads/{phone}/notes", dependencies=[Depends(require_admin)])
+def update_notes(phone: str, payload: NotesUpdate):
 
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE leads
                 SET
                     admin_notes = %s,
                     updated_at = NOW()
                 WHERE phone = %s
                 RETURNING phone, admin_notes
-            """, (payload.notes, phone))
+            """,
+                (payload.notes, phone),
+            )
 
             result = cur.fetchone()
 
             if not result:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Lead not found"
-                )
+                raise HTTPException(status_code=404, detail="Lead not found")
 
             return result
 
 
 # Mark customer enquiry as reviewed
-@router.patch(
-    "/leads/{phone}/mark-reviewed",
-    dependencies=[Depends(require_admin)]
-)
+@router.patch("/leads/{phone}/mark-reviewed", dependencies=[Depends(require_admin)])
 def mark_reviewed(phone: str):
 
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE leads
                 SET
                     needs_admin_followup = FALSE,
@@ -296,15 +249,14 @@ def mark_reviewed(phone: str):
                 RETURNING
                     phone,
                     needs_admin_followup
-            """, (phone,))
+            """,
+                (phone,),
+            )
 
             result = cur.fetchone()
 
             if not result:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Lead not found"
-                )
+                raise HTTPException(status_code=404, detail="Lead not found")
 
             return result
 
@@ -313,11 +265,9 @@ def mark_reviewed(phone: str):
 # ADMIN WHATSAPP REPLY AND BOT CONTROLS
 # ---------------------------------------
 
+
 class AdminReplyRequest(BaseModel):
-    message: str = Field(
-        min_length=1,
-        max_length=4096
-    )
+    message: str = Field(min_length=1, max_length=4096)
 
 
 class BotControlRequest(BaseModel):
@@ -328,10 +278,7 @@ def validate_phone(phone: str) -> str:
     """Accept WhatsApp customer numbers in digit format."""
 
     if not re.fullmatch(r"[1-9][0-9]{6,14}", phone):
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid customer phone number"
-        )
+        raise HTTPException(status_code=422, detail="Invalid customer phone number")
 
     return phone
 
@@ -339,11 +286,14 @@ def validate_phone(phone: str) -> str:
 def latest_customer_message(cur, phone: str):
     """Get the latest received customer-message timestamp."""
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT MAX(created_at) AS last_message_at
         FROM inbound_events
         WHERE phone = %s
-    """, (phone,))
+    """,
+        (phone,),
+    )
 
     result = cur.fetchone()
     return result["last_message_at"]
@@ -355,11 +305,7 @@ def get_window_details(last_message_at):
     now = datetime.now(timezone.utc)
 
     if last_message_at is None:
-        return {
-            "is_open": False,
-            "last_customer_message_at": None,
-            "expires_at": None
-        }
+        return {"is_open": False, "last_customer_message_at": None, "expires_at": None}
 
     expires_at = last_message_at + timedelta(hours=24)
 
@@ -369,15 +315,12 @@ def get_window_details(last_message_at):
     return {
         "is_open": is_open,
         "last_customer_message_at": last_message_at,
-        "expires_at": expires_at
+        "expires_at": expires_at,
     }
 
 
 # Check the WhatsApp messaging window
-@router.get(
-    "/leads/{phone}/reply-window",
-    dependencies=[Depends(require_admin)]
-)
+@router.get("/leads/{phone}/reply-window", dependencies=[Depends(require_admin)])
 def get_reply_window(phone: str):
 
     phone = validate_phone(phone)
@@ -385,41 +328,34 @@ def get_reply_window(phone: str):
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT phone
                 FROM leads
                 WHERE phone = %s
-            """, (phone,))
+            """,
+                (phone,),
+            )
 
             if not cur.fetchone():
-                raise HTTPException(
-                    status_code=404,
-                    detail="Lead not found"
-                )
+                raise HTTPException(status_code=404, detail="Lead not found")
 
-            last_message_at = latest_customer_message(
-                cur, phone
-            )
+            last_message_at = latest_customer_message(cur, phone)
 
             return get_window_details(last_message_at)
 
 
 # Pause or resume automatic qualification
-@router.patch(
-    "/leads/{phone}/bot",
-    dependencies=[Depends(require_admin)]
-)
-def control_bot(
-    phone: str,
-    payload: BotControlRequest
-):
+@router.patch("/leads/{phone}/bot", dependencies=[Depends(require_admin)])
+def control_bot(phone: str, payload: BotControlRequest):
 
     phone = validate_phone(phone)
 
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE leads
                 SET
                     bot_paused = %s,
@@ -436,74 +372,55 @@ def control_bot(
                     step,
                     bot_paused,
                     bot_paused_at
-            """, (
-                payload.paused,
-                payload.paused,
-                phone
-            ))
+            """,
+                (payload.paused, payload.paused, phone),
+            )
 
             result = cur.fetchone()
 
             if result is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Lead not found"
-                )
+                raise HTTPException(status_code=404, detail="Lead not found")
 
             return result
 
 
 # Admin replies from HYTOMA WhatsApp number
-@router.post(
-    "/leads/{phone}/reply",
-    dependencies=[Depends(require_admin)]
-)
-def admin_send_reply(
-    phone: str,
-    payload: AdminReplyRequest
-):
+@router.post("/leads/{phone}/reply", dependencies=[Depends(require_admin)])
+def admin_send_reply(phone: str, payload: AdminReplyRequest):
 
     phone = validate_phone(phone)
     message_text = payload.message.strip()
 
     if not message_text:
-        raise HTTPException(
-            status_code=422,
-            detail="Message cannot be empty"
-        )
+        raise HTTPException(status_code=422, detail="Message cannot be empty")
 
     with db_connect() as conn:
         with conn.cursor() as cur:
 
             # Lock this customer's lead while
             # checking permissions and sending.
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT phone, status, bot_paused
                 FROM leads
                 WHERE phone = %s
                 FOR UPDATE
-            """, (phone,))
+            """,
+                (phone,),
+            )
 
             lead = cur.fetchone()
 
             if lead is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Lead not found"
-                )
+                raise HTTPException(status_code=404, detail="Lead not found")
 
             # Prevent replies to opted-out contacts.
             if lead["status"] == "opted_out":
-                raise HTTPException(
-                    status_code=403,
-                    detail="Customer has opted out"
-                )
+                raise HTTPException(status_code=403, detail="Customer has opted out")
 
             # Check the messaging window again
             # server-side, not just in the UI.
-            last_message_at = latest_customer_message(
-                cur, phone
-            )
+            last_message_at = latest_customer_message(cur, phone)
 
             window = get_window_details(last_message_at)
 
@@ -514,31 +431,24 @@ def admin_send_reply(
                         "24-hour customer-service window "
                         "is closed. An approved WhatsApp "
                         "message template is required."
-                    )
+                    ),
                 )
 
             # Send using existing Meta Cloud API.
             try:
-                result = send_whatsapp_text(
-                    phone,
-                    message_text
-                )
+                result = send_whatsapp_text(phone, message_text)
 
             except requests.RequestException:
-                logger.exception(
-                    "Admin WhatsApp send failed for last4=%s",
-                    phone[-4:]
-                )
+                logger.exception("Admin WhatsApp send failed for last4=%s", phone[-4:])
 
                 raise HTTPException(
                     status_code=502,
                     detail=(
                         "WhatsApp provider request failed. "
                         "Check delivery before retrying."
-                    )
+                    ),
                 )
 
-            
             # Validate Meta's API response
             if not isinstance(result, dict):
                 logger.error(
@@ -552,16 +462,12 @@ def admin_send_reply(
                         "WhatsApp message may have been sent, "
                         "but no response was returned. "
                         "Check WhatsApp before retrying."
-                    )
+                    ),
                 )
 
             messages = result.get("messages") or []
 
-
-            message_id = (
-                messages[0].get("id")
-                if messages else None
-            )
+            message_id = messages[0].get("id") if messages else None
 
             if not message_id:
                 raise HTTPException(
@@ -569,11 +475,12 @@ def admin_send_reply(
                     detail=(
                         "Meta did not return a message ID. "
                         "Check delivery before retrying."
-                    )
+                    ),
                 )
 
             # Save the outgoing admin message.
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO chat_messages
                 (
                     phone,
@@ -588,32 +495,29 @@ def admin_send_reply(
                 )
                 ON CONFLICT (whatsapp_message_id)
                 DO NOTHING
-            """, (
-                phone,
-                message_id,
-                message_text
-            ))
+            """,
+                (phone, message_id, message_text),
+            )
 
             # Manual reply automatically pauses bot.
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE leads
                 SET
                     bot_paused = TRUE,
                     bot_paused_at = NOW(),
                     updated_at = NOW()
                 WHERE phone = %s
-            """, (phone,))
-
-            logger.info(
-                "Admin sent WhatsApp reply, last4=%s",
-                phone[-4:]
+            """,
+                (phone,),
             )
+
+            logger.info("Admin sent WhatsApp reply, last4=%s", phone[-4:])
 
             return {
                 "status": "accepted",
                 "phone": phone,
                 "whatsapp_message_id": message_id,
                 "bot_paused": True,
-                "message": message_text
+                "message": message_text,
             }
-
