@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from psycopg.rows import dict_row
 
 from auth import require_admin
-from db import db_connect
+from db import db_connect, customer_send_guard
 from whatsapp_service import send_whatsapp_text
 
 logger = logging.getLogger("hytoma")
@@ -197,37 +197,130 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
     # The reservation is now committed.
     # A duplicate request ID cannot cause a second send.
 
-    # PHASE 2: Contact Meta once.
+    
+    with customer_send_guard(phone):
+        try:
+            return _complete_reserved_safe_reply(
+                phone,
+                message,
+                request_id,
+            )
+        except HTTPException as exc:
+            if exc.status_code in (403, 404):
+                mark_unknown(
+                    request_id,
+                    "Pre-send permission/window check rejected request",
+                )
+            raise
+
+    # PHASE 2 and 3: Coordinate with bot/admin operations.
+    # The original request reservation is already committed.
+    # with customer_send_guard(phone):
+    #     return _complete_reserved_safe_reply(
+    #         phone,
+    #         message,
+    #         request_id,
+    #     )
+
+def _complete_reserved_safe_reply(phone, message, request_id):
+    """
+    Complete a reserved admin send while the caller
+    holds the customer's advisory lock.
+    """
+
+    # Recheck permission and customer-service window
+    # after waiting for the customer's lock.
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status
+                FROM leads
+                WHERE phone = %s
+                """,
+                (phone,),
+            )
+
+            lead = cur.fetchone()
+
+            if lead is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Lead not found",
+                )
+
+            if lead["status"] == "opted_out":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Customer has opted out",
+                )
+
+            cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM inbound_events
+                    WHERE phone = %s
+                      AND created_at >
+                          NOW() - INTERVAL '23 hours 59 minutes'
+                ) AS is_open
+                """,
+                (phone,),
+            )
+
+            window = cur.fetchone()
+
+            if not window["is_open"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail="24-hour reply window is closed",
+                )
+
+    # Since this request was already reserved as
+    # sending, rejected pre-send checks must not
+    # leave it stuck in that state.
+    #
+    # For now, mark these as unknown for review.
+    # We will add an explicit rejected status later
+    # rather than changing the existing DB constraint.
+
     try:
         result = send_whatsapp_text(phone, message)
 
         if not isinstance(result, dict):
-            raise RuntimeError("WhatsApp API did not return a valid response")
+            raise RuntimeError(
+                "WhatsApp API returned no valid response"
+            )
 
         sent_messages = result.get("messages") or []
 
         if not sent_messages:
-            raise RuntimeError("WhatsApp API response has no message ID")
+            raise RuntimeError(
+                "WhatsApp response has no messages"
+            )
 
         whatsapp_message_id = sent_messages[0].get("id")
 
         if not whatsapp_message_id:
-            raise RuntimeError("WhatsApp API did not provide a message ID")
+            raise RuntimeError(
+                "WhatsApp response has no message ID"
+            )
 
     except Exception as exc:
-        logger.exception("Outbound WhatsApp send outcome uncertain")
+        logger.exception(
+            "Admin WhatsApp send outcome uncertain"
+        )
+
         mark_unknown(request_id, exc)
 
         raise HTTPException(
             status_code=502,
             detail=(
                 "WhatsApp send outcome is uncertain. "
-                "Do not retry with a new request ID "
-                "before checking the customer's WhatsApp."
+                "Do not retry with another request ID."
             ),
         ) from exc
 
-    # PHASE 3: Save accepted message and pause the bot.
     try:
         with db_connect() as conn:
             with conn.cursor() as cur:
@@ -258,18 +351,16 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
                     (phone,),
                 )
 
-
                 cur.execute(
                     """
                     UPDATE bot_outbound_requests
                     SET status = 'cancelled',
                         updated_at = NOW()
                     WHERE phone = %s
-                    AND status = 'pending'
+                      AND status = 'pending'
                     """,
                     (phone,),
                 )
-
 
                 cur.execute(
                     """
@@ -279,12 +370,15 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
                         error_summary = NULL,
                         updated_at = NOW()
                     WHERE request_id = %s
+                      AND status = 'sending'
                     """,
                     (whatsapp_message_id, request_id),
                 )
 
     except Exception as exc:
-        logger.exception("Meta accepted message but saving failed")
+        logger.exception(
+            "Meta accepted admin reply but database save failed"
+        )
 
         mark_unknown(
             request_id,
@@ -296,8 +390,7 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
             status_code=502,
             detail=(
                 "Meta accepted the message, but database "
-                "confirmation failed. The original send "
-                "must be investigated before another attempt."
+                "confirmation failed. Do not resend."
             ),
         ) from exc
 
@@ -309,6 +402,7 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
         "already_processed": False,
         "bot_paused": True,
     }
+
 
 
 @router.get("/outbound-requests/{request_id}")

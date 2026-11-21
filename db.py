@@ -1,5 +1,6 @@
 """PostgreSQL storage and durable inbound webhook queue."""
 
+from contextlib import contextmanager
 import os
 import logging
 import psycopg
@@ -222,6 +223,37 @@ def db_connect():
         raise RuntimeError("DATABASE_URL must be configured")
 
     return psycopg.connect(url, row_factory=dict_row, connect_timeout=10)
+
+
+@contextmanager
+def customer_send_guard(phone: str):
+    """
+    Coordinate WhatsApp sends and admin takeover
+    for one customer.
+
+    The PostgreSQL transaction holds the advisory
+    lock until the guarded operation finishes.
+
+    All competing operations must use this same guard.
+    """
+    with db_connect() as lock_conn:
+        with lock_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended(%s, 48126)
+                )
+                """,
+                (str(phone),),
+            )
+
+        try:
+            yield
+        finally:
+            # The connection context releases the
+            # transaction-scoped lock on exit.
+            pass
+
 
 
 def initialize_database():
@@ -640,26 +672,26 @@ def mark_bot_outbound_unknown(inbound_message_id, reason):
         logger.exception("Failed to record uncertain bot send")
 
 
+
 def process_next_bot_outbound():
     """
-    Send one pending qualification reply.
-
-    Jobs are reserved and committed before calling Meta.
-    Sending and unknown jobs are never retried automatically.
+    Reserve one bot reply, then coordinate sending
+    with the customer's admin takeover lock.
     """
 
-    # 1. Reserve one job in a committed transaction.
+    # PHASE 1: Reserve job and commit before Meta call.
     with db_connect() as conn:
         with conn.cursor() as cur:
-
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT *
                 FROM bot_outbound_requests
                 WHERE status = 'pending'
                 ORDER BY created_at, inbound_message_id
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
-                """)
+                """
+            )
 
             job = cur.fetchone()
 
@@ -669,32 +701,6 @@ def process_next_bot_outbound():
             inbound_id = job["inbound_message_id"]
             phone = job["phone"]
             response = job["response_payload"]
-
-            # Do not send queued replies after admin takeover.
-            cur.execute(
-                """
-                SELECT bot_paused
-                FROM leads
-                WHERE phone = %s
-                FOR UPDATE
-                """,
-                (phone,),
-            )
-
-            lead = cur.fetchone()
-
-            if lead is None or lead["bot_paused"]:
-                cur.execute(
-                    """
-                    UPDATE bot_outbound_requests
-                    SET status = 'cancelled',
-                        updated_at = NOW()
-                    WHERE inbound_message_id = %s
-                    """,
-                    (inbound_id,),
-                )
-
-                return True
 
             cur.execute(
                 """
@@ -707,89 +713,136 @@ def process_next_bot_outbound():
                 (inbound_id,),
             )
 
-    # Reservation has committed before this API call.
+    # PHASE 2: Coordinate with admin pause/reply.
+    with customer_send_guard(phone):
 
-    # 2. Send the message exactly once for this job.
-    try:
-        result = send_qualification_reply(
-            phone,
-            response,
-        )
-
-        if not isinstance(result, dict):
-            raise RuntimeError("WhatsApp sender returned no valid response")
-
-        sent_messages = result.get("messages") or []
-
-        if not sent_messages:
-            raise RuntimeError("WhatsApp response has no messages array")
-
-        whatsapp_message_id = sent_messages[0].get("id")
-
-        if not whatsapp_message_id:
-            raise RuntimeError("WhatsApp response has no message ID")
-
-    except Exception as exc:
-        logger.exception(
-            "Bot send outcome uncertain: inbound=%s",
-            inbound_id,
-        )
-
-        mark_bot_outbound_unknown(inbound_id, exc)
-        return True
-
-    # 3. Save the accepted message and finish the job.
-    try:
+        # Recheck the bot state AFTER acquiring the lock.
         with db_connect() as conn:
             with conn.cursor() as cur:
-
                 cur.execute(
                     """
-                    INSERT INTO chat_messages (
-                        phone,
-                        whatsapp_message_id,
-                        direction,
-                        message_type,
-                        content
-                    )
-                    VALUES (
-                        %s, %s, 'outgoing', %s, %s
-                    )
-                    ON CONFLICT (whatsapp_message_id)
-                    DO NOTHING
+                    SELECT bot_paused
+                    FROM leads
+                    WHERE phone = %s
                     """,
-                    (
-                        phone,
-                        whatsapp_message_id,
-                        response["type"],
-                        response["body"],
-                    ),
+                    (phone,),
                 )
 
-                cur.execute(
-                    """
-                    UPDATE bot_outbound_requests
-                    SET status = 'accepted',
-                        whatsapp_message_id = %s,
-                        error_summary = NULL,
-                        updated_at = NOW()
-                    WHERE inbound_message_id = %s
-                      AND status = 'sending'
-                    """,
-                    (
-                        whatsapp_message_id,
+                lead = cur.fetchone()
+
+                if lead is None or lead["bot_paused"]:
+                    cur.execute(
+                        """
+                        UPDATE bot_outbound_requests
+                        SET status = 'cancelled',
+                            updated_at = NOW()
+                        WHERE inbound_message_id = %s
+                          AND status = 'sending'
+                        """,
+                        (inbound_id,),
+                    )
+
+                    logger.info(
+                        "Cancelled reserved bot reply: inbound=%s",
                         inbound_id,
-                    ),
+                    )
+                    return True
+
+        # PHASE 3: Call Meta once while holding the lock.
+        try:
+            result = send_qualification_reply(
+                phone,
+                response,
+            )
+
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "No valid WhatsApp API response"
                 )
 
-        logger.info(
-            "Bot reply accepted: inbound=%s",
-            inbound_id,
-        )
+            sent_messages = result.get("messages") or []
 
-    except Exception as exc:
-        logger.exception("Meta accepted bot reply but saving failed")
+            if not sent_messages:
+                raise RuntimeError(
+                    "WhatsApp response contains no message ID"
+                )
 
-        mark_bot_outbound_unknown(inbound_id, exc)
+            whatsapp_message_id = sent_messages[0].get("id")
+
+            if not whatsapp_message_id:
+                raise RuntimeError(
+                    "Missing WhatsApp message ID"
+                )
+
+        except Exception as exc:
+            logger.exception(
+                "Bot send outcome uncertain: inbound=%s",
+                inbound_id,
+            )
+
+            mark_bot_outbound_unknown(
+                inbound_id,
+                exc,
+            )
+
+            return True
+
+        # PHASE 4: Persist the accepted result.
+        try:
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO chat_messages (
+                            phone,
+                            whatsapp_message_id,
+                            direction,
+                            message_type,
+                            content
+                        )
+                        VALUES (
+                            %s, %s, 'outgoing', %s, %s
+                        )
+                        ON CONFLICT (whatsapp_message_id)
+                        DO NOTHING
+                        """,
+                        (
+                            phone,
+                            whatsapp_message_id,
+                            response["type"],
+                            response["body"],
+                        ),
+                    )
+
+                    cur.execute(
+                        """
+                        UPDATE bot_outbound_requests
+                        SET status = 'accepted',
+                            whatsapp_message_id = %s,
+                            error_summary = NULL,
+                            updated_at = NOW()
+                        WHERE inbound_message_id = %s
+                          AND status = 'sending'
+                        """,
+                        (
+                            whatsapp_message_id,
+                            inbound_id,
+                        ),
+                    )
+
+            logger.info(
+                "Bot reply accepted: inbound=%s",
+                inbound_id,
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Meta accepted bot reply but saving failed"
+            )
+
+            mark_bot_outbound_unknown(
+                inbound_id,
+                exc,
+            )
 
     return True

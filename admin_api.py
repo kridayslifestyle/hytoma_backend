@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
-from db import db_connect
+from db import db_connect, customer_send_guard
 
 from datetime import datetime, timedelta, timezone
 import re
@@ -347,6 +347,7 @@ def get_reply_window(phone: str):
 
 # Pause or resume automatic qualification
 
+
 @router.patch(
     "/leads/{phone}/bot",
     dependencies=[Depends(require_admin)],
@@ -355,10 +356,15 @@ def control_bot(phone: str, payload: BotControlRequest):
 
     phone = validate_phone(phone)
 
+    with customer_send_guard(phone):
+        return _control_bot_locked(phone, payload)
+
+
+def _control_bot_locked(phone: str, payload: BotControlRequest):
+
     with db_connect() as conn:
+
         with conn.cursor() as cur:
-
-
 
             # Match the bot sender's lock order:
             # outbound job rows first, then lead row.
@@ -373,7 +379,6 @@ def control_bot(phone: str, payload: BotControlRequest):
                 """,
                 (phone,),
             )
-
 
             # Lock this customer's lead while updating
             # the bot control state.
@@ -442,7 +447,6 @@ def control_bot(phone: str, payload: BotControlRequest):
                 **result,
                 "cancelled_pending_replies": cancelled_jobs,
             }
-
 
 
 @router.post(
