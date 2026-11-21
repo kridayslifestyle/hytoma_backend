@@ -42,6 +42,25 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def csrf_for_session(session_token: str) -> str:
+    """
+    Derive a stable CSRF token for one login session.
+
+    The session token is random and stored in an
+    HttpOnly cookie. The browser cannot read it
+    directly.
+
+    The derived CSRF token remains the same across
+    multiple calls to /auth/me.
+    """
+    return hashlib.sha256(
+        (
+            "hytoma-csrf-v1:" + session_token
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+
 def unauthorized():
     raise HTTPException(
         status_code=401,
@@ -223,7 +242,7 @@ def login(payload: LoginRequest, request: Request, response: Response):
                 # when this connection context exits.
             else:
                 token = secrets.token_urlsafe(48)
-                csrf = secrets.token_urlsafe(32)
+                csrf = csrf_for_session(token)
 
                 cur.execute("""
                     DELETE FROM admin_sessions
@@ -271,6 +290,7 @@ def login(payload: LoginRequest, request: Request, response: Response):
     }
 
 
+
 @router.get("/me")
 def current_user(request: Request):
     session = get_session(request)
@@ -278,26 +298,40 @@ def current_user(request: Request):
     if session is None:
         unauthorized()
 
-    # Rotate CSRF token on session restoration.
-    csrf = secrets.token_urlsafe(32)
+    token = request.cookies.get(COOKIE_NAME)
 
+    if not token:
+        unauthorized()
+
+    # Same token for the lifetime of this session.
+    csrf = csrf_for_session(token)
+
+    # Also update existing sessions created before
+    # this change, so they can be restored safely.
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE admin_sessions
                 SET csrf_hash = %s
                 WHERE token_hash = %s
                   AND expires_at > NOW()
-            """, (
-                digest(csrf),
-                digest(request.cookies[COOKIE_NAME])
-            ))
+                """,
+                (
+                    digest(csrf),
+                    digest(token),
+                ),
+            )
+
+            if cur.rowcount != 1:
+                unauthorized()
 
     return {
         "authenticated": True,
         "username": session["username"],
-        "csrf_token": csrf
+        "csrf_token": csrf,
     }
+
 
 
 @router.post("/logout")
