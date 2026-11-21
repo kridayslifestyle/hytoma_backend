@@ -22,7 +22,9 @@ from fastapi.responses import PlainTextResponse
 from sales_management_api import router as sales_management_router
 from admin_api import router as admin_router
 from safe_reply_api import router as safe_reply_router
-
+from delivery_status import record_delivery_statuses
+from delivery_status import record_delivery_statuses
+from delivery_status_api import router as delivery_status_router
 from db import (
     initialize_database,
     enqueue_event,
@@ -114,7 +116,7 @@ app.include_router(admin_router)
 app.include_router(sales_management_router)
 app.include_router(inbox_router)
 app.include_router(safe_reply_router)
-
+app.include_router(delivery_status_router)
 
 @app.get("/")
 def home():
@@ -252,6 +254,10 @@ async def receive_webhook(request: Request):
             status_code=400,
             detail="Expected JSON object"
         )
+    await asyncio.to_thread(
+        record_delivery_statuses,
+        payload,
+    )
 
     for entry in payload.get("entry", []):
 

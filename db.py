@@ -161,6 +161,31 @@ CREATE TABLE IF NOT EXISTS outbound_requests (
 CREATE INDEX IF NOT EXISTS outbound_requests_phone_idx
 ON outbound_requests (phone, created_at DESC);
 
+
+-- Delivery status of outgoing WhatsApp messages
+CREATE TABLE IF NOT EXISTS whatsapp_message_statuses (
+    whatsapp_message_id TEXT PRIMARY KEY,
+    recipient_phone TEXT,
+    delivery_status TEXT NOT NULL DEFAULT 'accepted'
+        CHECK (
+            delivery_status IN (
+                'accepted',
+                'sent',
+                'delivered',
+                'read',
+                'failed'
+            )
+        ),
+    status_timestamp TIMESTAMPTZ,
+    error_code TEXT,
+    error_details TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS whatsapp_statuses_phone_idx
+ON whatsapp_message_statuses (recipient_phone);
+
+
 """
 
 
