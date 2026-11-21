@@ -23,13 +23,14 @@ from sales_management_api import router as sales_management_router
 from admin_api import router as admin_router
 from safe_reply_api import router as safe_reply_router
 from delivery_status import record_delivery_statuses
-from delivery_status import record_delivery_statuses
 from delivery_status_api import router as delivery_status_router
 from db import (
     initialize_database,
     enqueue_event,
-    process_next_event
+    process_next_event,
+    process_next_bot_outbound,
 )
+
 
 
 
@@ -61,15 +62,20 @@ EXPECTED_SENDER_ID = os.getenv(
 
 
 # Background event processor
+
 async def worker_loop():
 
     while True:
         try:
-            processed = await asyncio.to_thread(
+            inbound_processed = await asyncio.to_thread(
                 process_next_event
             )
 
-            if not processed:
+            outbound_processed = await asyncio.to_thread(
+                process_next_bot_outbound
+            )
+
+            if not inbound_processed and not outbound_processed:
                 await asyncio.sleep(2)
 
         except asyncio.CancelledError:
@@ -78,6 +84,7 @@ async def worker_loop():
         except Exception:
             logger.exception("Worker error")
             await asyncio.sleep(5)
+
 
 
 # Application startup
@@ -272,12 +279,16 @@ async def receive_webhook(request: Request):
                 value.get("metadata") or {}
             ).get("phone_number_id")
 
+            
             if (
-                EXPECTED_SENDER_ID
-                and sender_id
-                and sender_id != EXPECTED_SENDER_ID
+                not EXPECTED_SENDER_ID
+                or sender_id != EXPECTED_SENDER_ID
             ):
+                logger.warning(
+                "Ignoring webhook event with unexpected sender ID"
+                )
                 continue
+
 
             for msg in value.get("messages") or []:
 

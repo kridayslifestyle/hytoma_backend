@@ -6,14 +6,13 @@ import psycopg
 
 
 from datetime import datetime, timedelta, timezone
-
-from qualification import decide_next, text_reply, RETURNING_CUSTOMER_MESSAGE
-
-from whatsapp_service import send_qualification_reply
-
-
+from psycopg.types.json import Jsonb
 from psycopg.rows import dict_row
-from qualification import decide_next
+from qualification import (
+    decide_next,
+    text_reply,
+    RETURNING_CUSTOMER_MESSAGE,
+)
 from whatsapp_service import send_qualification_reply
 
 logger = logging.getLogger("hytoma")
@@ -184,6 +183,33 @@ CREATE TABLE IF NOT EXISTS whatsapp_message_statuses (
 
 CREATE INDEX IF NOT EXISTS whatsapp_statuses_phone_idx
 ON whatsapp_message_statuses (recipient_phone);
+
+
+-- Durable qualification-bot outbound queue
+CREATE TABLE IF NOT EXISTS bot_outbound_requests (
+    inbound_message_id TEXT PRIMARY KEY
+        REFERENCES inbound_events(message_id),
+    phone TEXT NOT NULL,
+    response_payload JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (
+            status IN (
+                'pending',
+                'sending',
+                'accepted',
+                'unknown',
+                'cancelled'
+            )
+        ),
+    whatsapp_message_id TEXT UNIQUE,
+    error_summary TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS bot_outbound_pending_idx
+ON bot_outbound_requests (status, created_at);
+
 
 
 """
@@ -498,48 +524,35 @@ def process_next_event():
                                     (phone,),
                                 )
 
+
+                
                 # --------------------------------
-                # 5. SEND AND SAVE BOT RESPONSE
+                # 5. QUEUE BOT RESPONSE DURABLY
                 # --------------------------------
-                # IMPORTANT:
-                # Everything involving result must
-                # remain inside this condition.
+                # Do not call Meta inside this transaction.
+                # One inbound event can create one bot job.
 
                 if response is not None:
 
-                    result = send_qualification_reply(phone, response)
-
-                    outgoing_id = None
-
-                    if isinstance(result, dict):
-                        messages = result.get("messages") or []
-
-                        if messages:
-                            outgoing_id = messages[0].get("id")
-
-                    # Save outgoing response to chat history
                     cur.execute(
                         """
-                        INSERT INTO chat_messages
-                        (
+                        INSERT INTO bot_outbound_requests (
+                            inbound_message_id,
                             phone,
-                            whatsapp_message_id,
-                            direction,
-                            message_type,
-                            content
+                            response_payload,
+                            status
                         )
-                        VALUES (
-                            %s,
-                            %s,
-                            'outgoing',
-                            %s,
-                            %s
-                        )
-                        ON CONFLICT (whatsapp_message_id)
+                        VALUES (%s, %s, %s, 'pending')
+                        ON CONFLICT (inbound_message_id)
                         DO NOTHING
-                    """,
-                        (phone, outgoing_id, response["type"], response["body"]),
+                        """,
+                        (
+                            event_id,
+                            phone,
+                            Jsonb(response),
+                        ),
                     )
+
 
                 # --------------------------------
                 # 6. MARK INCOMING EVENT PROCESSED
@@ -601,3 +614,191 @@ def process_next_event():
                 logger.exception("Unable to record processing failure")
 
         return False
+
+
+def mark_bot_outbound_unknown(inbound_message_id, reason):
+    """Keep uncertain bot sends blocked from automatic retry."""
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE bot_outbound_requests
+                    SET status = 'unknown',
+                        error_summary = %s,
+                        updated_at = NOW()
+                    WHERE inbound_message_id = %s
+                      AND status = 'sending'
+                    """,
+                    (str(reason)[:500], inbound_message_id),
+                )
+    except Exception:
+        logger.exception(
+            "Failed to record uncertain bot send"
+        )
+
+
+def process_next_bot_outbound():
+    """
+    Send one pending qualification reply.
+
+    Jobs are reserved and committed before calling Meta.
+    Sending and unknown jobs are never retried automatically.
+    """
+
+    # 1. Reserve one job in a committed transaction.
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT *
+                FROM bot_outbound_requests
+                WHERE status = 'pending'
+                ORDER BY created_at, inbound_message_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+                """
+            )
+
+            job = cur.fetchone()
+
+            if job is None:
+                return False
+
+            inbound_id = job["inbound_message_id"]
+            phone = job["phone"]
+            response = job["response_payload"]
+
+            # Do not send queued replies after admin takeover.
+            cur.execute(
+                """
+                SELECT bot_paused
+                FROM leads
+                WHERE phone = %s
+                FOR UPDATE
+                """,
+                (phone,),
+            )
+
+            lead = cur.fetchone()
+
+            if lead is None or lead["bot_paused"]:
+                cur.execute(
+                    """
+                    UPDATE bot_outbound_requests
+                    SET status = 'cancelled',
+                        updated_at = NOW()
+                    WHERE inbound_message_id = %s
+                    """,
+                    (inbound_id,),
+                )
+
+                return True
+
+            cur.execute(
+                """
+                UPDATE bot_outbound_requests
+                SET status = 'sending',
+                    updated_at = NOW()
+                WHERE inbound_message_id = %s
+                  AND status = 'pending'
+                """,
+                (inbound_id,),
+            )
+
+    # Reservation has committed before this API call.
+
+    # 2. Send the message exactly once for this job.
+    try:
+        result = send_qualification_reply(
+            phone,
+            response,
+        )
+
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "WhatsApp sender returned no valid response"
+            )
+
+        sent_messages = result.get("messages") or []
+
+        if not sent_messages:
+            raise RuntimeError(
+                "WhatsApp response has no messages array"
+            )
+
+        whatsapp_message_id = sent_messages[0].get("id")
+
+        if not whatsapp_message_id:
+            raise RuntimeError(
+                "WhatsApp response has no message ID"
+            )
+
+    except Exception as exc:
+        logger.exception(
+            "Bot send outcome uncertain: inbound=%s",
+            inbound_id,
+        )
+
+        mark_bot_outbound_unknown(inbound_id, exc)
+        return True
+
+    # 3. Save the accepted message and finish the job.
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    INSERT INTO chat_messages (
+                        phone,
+                        whatsapp_message_id,
+                        direction,
+                        message_type,
+                        content
+                    )
+                    VALUES (
+                        %s, %s, 'outgoing', %s, %s
+                    )
+                    ON CONFLICT (whatsapp_message_id)
+                    DO NOTHING
+                    """,
+                    (
+                        phone,
+                        whatsapp_message_id,
+                        response["type"],
+                        response["body"],
+                    ),
+                )
+
+                cur.execute(
+                    """
+                    UPDATE bot_outbound_requests
+                    SET status = 'accepted',
+                        whatsapp_message_id = %s,
+                        error_summary = NULL,
+                        updated_at = NOW()
+                    WHERE inbound_message_id = %s
+                      AND status = 'sending'
+                    """,
+                    (
+                        whatsapp_message_id,
+                        inbound_id,
+                    ),
+                )
+
+        logger.info(
+            "Bot reply accepted: inbound=%s",
+            inbound_id,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "Meta accepted bot reply but saving failed"
+        )
+
+        mark_bot_outbound_unknown(inbound_id, exc)
+
+    return True
+
