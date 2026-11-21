@@ -230,7 +230,14 @@ def initialize_database():
             cur.execute(SCHEMA, prepare=False)
 
 
-def enqueue_event(message_id, phone, message_text, sender_number_id, ad_id):
+def enqueue_event(
+    message_id,
+    phone,
+    message_text,
+    sender_number_id,
+    ad_id,
+    display_content=None,
+):
     with db_connect() as conn:
         with conn.cursor() as cur:
 
@@ -273,7 +280,7 @@ def enqueue_event(message_id, phone, message_text, sender_number_id, ad_id):
                 ON CONFLICT (whatsapp_message_id)
                 DO NOTHING
             """,
-                (phone, message_id, message_text),
+                (phone, message_id, display_content or message_text),
             )
 
             return True
@@ -524,8 +531,6 @@ def process_next_event():
                                     (phone,),
                                 )
 
-
-                
                 # --------------------------------
                 # 5. QUEUE BOT RESPONSE DURABLY
                 # --------------------------------
@@ -552,7 +557,6 @@ def process_next_event():
                             Jsonb(response),
                         ),
                     )
-
 
                 # --------------------------------
                 # 6. MARK INCOMING EVENT PROCESSED
@@ -633,9 +637,7 @@ def mark_bot_outbound_unknown(inbound_message_id, reason):
                     (str(reason)[:500], inbound_message_id),
                 )
     except Exception:
-        logger.exception(
-            "Failed to record uncertain bot send"
-        )
+        logger.exception("Failed to record uncertain bot send")
 
 
 def process_next_bot_outbound():
@@ -650,16 +652,14 @@ def process_next_bot_outbound():
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute(
-                """
+            cur.execute("""
                 SELECT *
                 FROM bot_outbound_requests
                 WHERE status = 'pending'
                 ORDER BY created_at, inbound_message_id
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
-                """
-            )
+                """)
 
             job = cur.fetchone()
 
@@ -717,23 +717,17 @@ def process_next_bot_outbound():
         )
 
         if not isinstance(result, dict):
-            raise RuntimeError(
-                "WhatsApp sender returned no valid response"
-            )
+            raise RuntimeError("WhatsApp sender returned no valid response")
 
         sent_messages = result.get("messages") or []
 
         if not sent_messages:
-            raise RuntimeError(
-                "WhatsApp response has no messages array"
-            )
+            raise RuntimeError("WhatsApp response has no messages array")
 
         whatsapp_message_id = sent_messages[0].get("id")
 
         if not whatsapp_message_id:
-            raise RuntimeError(
-                "WhatsApp response has no message ID"
-            )
+            raise RuntimeError("WhatsApp response has no message ID")
 
     except Exception as exc:
         logger.exception(
@@ -794,11 +788,8 @@ def process_next_bot_outbound():
         )
 
     except Exception as exc:
-        logger.exception(
-            "Meta accepted bot reply but saving failed"
-        )
+        logger.exception("Meta accepted bot reply but saving failed")
 
         mark_bot_outbound_unknown(inbound_id, exc)
 
     return True
-

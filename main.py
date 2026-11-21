@@ -231,6 +231,39 @@ def extract_text(msg: dict) -> str | None:
     return None
 
 
+def extract_display_text(msg: dict) -> str | None:
+    """
+    Extract customer-friendly WhatsApp answers
+    for the admin conversation history.
+    """
+
+    message_type = msg.get("type")
+
+    if message_type == "text":
+        return (msg.get("text") or {}).get("body")
+
+    if message_type == "interactive":
+        interactive = msg.get("interactive") or {}
+
+        button = interactive.get("button_reply") or {}
+        selected_list = interactive.get("list_reply") or {}
+
+        return (
+            button.get("title")
+            or selected_list.get("title")
+            or button.get("id")
+            or selected_list.get("id")
+        )
+
+    if message_type == "button":
+        button = msg.get("button") or {}
+
+        return button.get("text") or button.get("payload")
+
+    return None
+
+
+
 # Receive WhatsApp messages
 @app.post("/webhook/whatsapp")
 async def receive_webhook(request: Request):
@@ -296,6 +329,7 @@ async def receive_webhook(request: Request):
                 phone = msg.get("from")
 
                 content = extract_text(msg)
+                display_content = extract_display_text(msg) or content
 
                 if (
                     not message_id
@@ -312,14 +346,17 @@ async def receive_webhook(request: Request):
                     else None
                 )
 
+                
                 await asyncio.to_thread(
                     enqueue_event,
                     message_id,
                     phone,
                     content,
                     sender_id,
-                    ad_id
+                    ad_id,
+                    display_content,
                 )
+
 
     return {
         "status": "received"
