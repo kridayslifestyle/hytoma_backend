@@ -118,6 +118,8 @@ def get_leads(
                     assigned_salesperson,
                     sales_status,
                     needs_admin_followup,
+                    bot_paused,
+                    bot_paused_at,
                     updated_at,
                     created_at
                 FROM leads
