@@ -346,13 +346,52 @@ def get_reply_window(phone: str):
 
 
 # Pause or resume automatic qualification
-@router.patch("/leads/{phone}/bot", dependencies=[Depends(require_admin)])
+
+@router.patch(
+    "/leads/{phone}/bot",
+    dependencies=[Depends(require_admin)],
+)
 def control_bot(phone: str, payload: BotControlRequest):
 
     phone = validate_phone(phone)
 
     with db_connect() as conn:
         with conn.cursor() as cur:
+
+
+
+            # Match the bot sender's lock order:
+            # outbound job rows first, then lead row.
+            cur.execute(
+                """
+                SELECT inbound_message_id
+                FROM bot_outbound_requests
+                WHERE phone = %s
+                  AND status = 'pending'
+                ORDER BY created_at, inbound_message_id
+                FOR UPDATE
+                """,
+                (phone,),
+            )
+
+
+            # Lock this customer's lead while updating
+            # the bot control state.
+            cur.execute(
+                """
+                SELECT phone
+                FROM leads
+                WHERE phone = %s
+                FOR UPDATE
+                """,
+                (phone,),
+            )
+
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Lead not found",
+                )
 
             cur.execute(
                 """
@@ -372,152 +411,57 @@ def control_bot(phone: str, payload: BotControlRequest):
                     step,
                     bot_paused,
                     bot_paused_at
-            """,
-                (payload.paused, payload.paused, phone),
+                """,
+                (
+                    payload.paused,
+                    payload.paused,
+                    phone,
+                ),
             )
 
             result = cur.fetchone()
 
-            if result is None:
-                raise HTTPException(status_code=404, detail="Lead not found")
+            cancelled_jobs = 0
 
-            return result
-
-
-# Admin replies from HYTOMA WhatsApp number
-@router.post("/leads/{phone}/reply", dependencies=[Depends(require_admin)])
-def admin_send_reply(phone: str, payload: AdminReplyRequest):
-
-    phone = validate_phone(phone)
-    message_text = payload.message.strip()
-
-    if not message_text:
-        raise HTTPException(status_code=422, detail="Message cannot be empty")
-
-    with db_connect() as conn:
-        with conn.cursor() as cur:
-
-            # Lock this customer's lead while
-            # checking permissions and sending.
-            cur.execute(
-                """
-                SELECT phone, status, bot_paused
-                FROM leads
-                WHERE phone = %s
-                FOR UPDATE
-            """,
-                (phone,),
-            )
-
-            lead = cur.fetchone()
-
-            if lead is None:
-                raise HTTPException(status_code=404, detail="Lead not found")
-
-            # Prevent replies to opted-out contacts.
-            if lead["status"] == "opted_out":
-                raise HTTPException(status_code=403, detail="Customer has opted out")
-
-            # Check the messaging window again
-            # server-side, not just in the UI.
-            last_message_at = latest_customer_message(cur, phone)
-
-            window = get_window_details(last_message_at)
-
-            if not window["is_open"]:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "24-hour customer-service window "
-                        "is closed. An approved WhatsApp "
-                        "message template is required."
-                    ),
+            if payload.paused:
+                cur.execute(
+                    """
+                    UPDATE bot_outbound_requests
+                    SET
+                        status = 'cancelled',
+                        updated_at = NOW()
+                    WHERE phone = %s
+                      AND status = 'pending'
+                    """,
+                    (phone,),
                 )
 
-            # Send using existing Meta Cloud API.
-            try:
-                result = send_whatsapp_text(phone, message_text)
-
-            except requests.RequestException:
-                logger.exception("Admin WhatsApp send failed for last4=%s", phone[-4:])
-
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        "WhatsApp provider request failed. "
-                        "Check delivery before retrying."
-                    ),
-                )
-
-            # Validate Meta's API response
-            if not isinstance(result, dict):
-                logger.error(
-                    "WhatsApp send returned no API response; "
-                    "delivery may already have succeeded."
-                )
-
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        "WhatsApp message may have been sent, "
-                        "but no response was returned. "
-                        "Check WhatsApp before retrying."
-                    ),
-                )
-
-            messages = result.get("messages") or []
-
-            message_id = messages[0].get("id") if messages else None
-
-            if not message_id:
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        "Meta did not return a message ID. "
-                        "Check delivery before retrying."
-                    ),
-                )
-
-            # Save the outgoing admin message.
-            cur.execute(
-                """
-                INSERT INTO chat_messages
-                (
-                    phone,
-                    whatsapp_message_id,
-                    direction,
-                    message_type,
-                    content
-                )
-                VALUES (
-                    %s, %s, 'outgoing',
-                    'text', %s
-                )
-                ON CONFLICT (whatsapp_message_id)
-                DO NOTHING
-            """,
-                (phone, message_id, message_text),
-            )
-
-            # Manual reply automatically pauses bot.
-            cur.execute(
-                """
-                UPDATE leads
-                SET
-                    bot_paused = TRUE,
-                    bot_paused_at = NOW(),
-                    updated_at = NOW()
-                WHERE phone = %s
-            """,
-                (phone,),
-            )
-
-            logger.info("Admin sent WhatsApp reply, last4=%s", phone[-4:])
+                cancelled_jobs = cur.rowcount
 
             return {
-                "status": "accepted",
-                "phone": phone,
-                "whatsapp_message_id": message_id,
-                "bot_paused": True,
-                "message": message_text,
+                **result,
+                "cancelled_pending_replies": cancelled_jobs,
             }
+
+
+
+@router.post(
+    "/leads/{phone}/reply",
+    dependencies=[Depends(require_admin)],
+    deprecated=True,
+)
+def admin_send_reply(phone: str):
+    """
+    Legacy endpoint disabled.
+
+    All administrator replies must use the
+    idempotent /reply-safe endpoint.
+    """
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Legacy WhatsApp reply endpoint disabled. "
+            "Use /admin/leads/{phone}/reply-safe "
+            "with a unique request_id."
+        ),
+    )
