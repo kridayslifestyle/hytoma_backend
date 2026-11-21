@@ -10,7 +10,7 @@ import sys
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from auth import router as auth_router
-
+from inbox_api import router as inbox_router
 from fastapi import (
     FastAPI,
     Query,
@@ -111,6 +111,7 @@ app = FastAPI(
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(sales_management_router)
+app.include_router(inbox_router)
 
 
 @app.get("/")
