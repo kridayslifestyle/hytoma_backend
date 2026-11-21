@@ -1,4 +1,3 @@
-
 """Idempotent HYTOMA admin WhatsApp replies."""
 
 import logging
@@ -11,7 +10,6 @@ from psycopg.rows import dict_row
 from auth import require_admin
 from db import db_connect
 from whatsapp_service import send_whatsapp_text
-
 
 logger = logging.getLogger("hytoma")
 
@@ -27,26 +25,43 @@ class SafeReplyRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4096)
 
 
-def mark_unknown(request_id, error_message):
-    """Mark uncertain requests without re-sending them."""
+def mark_unknown(
+    request_id,
+    error_message,
+    whatsapp_message_id=None,
+):
+    """
+    Preserve an uncertain result.
+
+    If Meta returned a message ID, retain it for
+    reconciliation without sending another message.
+    """
     try:
         with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     UPDATE outbound_requests
-                    SET status = 'unknown',
+                    SET
+                        status = 'unknown',
+                        whatsapp_message_id = COALESCE(
+                            whatsapp_message_id,
+                            %s
+                        ),
                         error_summary = %s,
                         updated_at = NOW()
                     WHERE request_id = %s
                       AND status = 'sending'
                     """,
-                    (str(error_message)[:500], request_id),
+                    (
+                        whatsapp_message_id,
+                        str(error_message)[:500],
+                        request_id,
+                    ),
                 )
+
     except Exception:
-        logger.exception(
-            "Unable to record uncertain outbound request"
-        )
+        logger.exception("Unable to record uncertain outbound request")
 
 
 @router.post("/leads/{phone}/reply-safe")
@@ -56,22 +71,13 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
     request_id = payload.request_id
 
     if not phone.isdigit() or not (8 <= len(phone) <= 15):
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid WhatsApp phone number"
-        )
+        raise HTTPException(status_code=422, detail="Invalid WhatsApp phone number")
 
     if not message:
-        raise HTTPException(
-            status_code=422,
-            detail="Message cannot be empty"
-        )
+        raise HTTPException(status_code=422, detail="Message cannot be empty")
 
     if len(message) > 4096:
-        raise HTTPException(
-            status_code=422,
-            detail="Message is too long"
-        )
+        raise HTTPException(status_code=422, detail="Message is too long")
 
     # PHASE 1: Reserve the request in PostgreSQL.
     # This transaction must commit before the Meta API call.
@@ -106,19 +112,14 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
 
                 if not existing:
                     raise HTTPException(
-                        status_code=409,
-                        detail="Request is being processed"
+                        status_code=409, detail="Request is being processed"
                     )
 
-                if (
-                    existing["phone"] != phone
-                    or existing["message_text"] != message
-                ):
+                if existing["phone"] != phone or existing["message_text"] != message:
                     raise HTTPException(
                         status_code=409,
                         detail=(
-                            "Request ID was already used "
-                            "for a different message"
+                            "Request ID was already used " "for a different message"
                         ),
                     )
 
@@ -127,8 +128,7 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
                         "status": "accepted",
                         "phone": phone,
                         "request_id": str(request_id),
-                        "whatsapp_message_id":
-                            existing["whatsapp_message_id"],
+                        "whatsapp_message_id": existing["whatsapp_message_id"],
                         "already_processed": True,
                     }
 
@@ -155,16 +155,10 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
             lead = cur.fetchone()
 
             if not lead:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Customer lead not found"
-                )
+                raise HTTPException(status_code=404, detail="Customer lead not found")
 
             if lead["status"] == "opted_out":
-                raise HTTPException(
-                    status_code=403,
-                    detail="Customer has opted out"
-                )
+                raise HTTPException(status_code=403, detail="Customer has opted out")
 
             # Match the existing admin window rule:
             # latest inbound within 24 hours, with a
@@ -189,10 +183,7 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
                     NOW() - INTERVAL '23 hours 59 minutes'
                 ) AS is_open
                 """,
-                (
-                    latest["created_at"]
-                    if latest else None,
-                ),
+                (latest["created_at"] if latest else None,),
             )
 
             check = cur.fetchone()
@@ -200,10 +191,7 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
             if check["is_open"] is not True:
                 raise HTTPException(
                     status_code=403,
-                    detail=(
-                        "24-hour customer-service "
-                        "reply window is closed"
-                    ),
+                    detail=("24-hour customer-service " "reply window is closed"),
                 )
 
     # The reservation is now committed.
@@ -214,28 +202,20 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
         result = send_whatsapp_text(phone, message)
 
         if not isinstance(result, dict):
-            raise RuntimeError(
-                "WhatsApp API did not return a valid response"
-            )
+            raise RuntimeError("WhatsApp API did not return a valid response")
 
         sent_messages = result.get("messages") or []
 
         if not sent_messages:
-            raise RuntimeError(
-                "WhatsApp API response has no message ID"
-            )
+            raise RuntimeError("WhatsApp API response has no message ID")
 
         whatsapp_message_id = sent_messages[0].get("id")
 
         if not whatsapp_message_id:
-            raise RuntimeError(
-                "WhatsApp API did not provide a message ID"
-            )
+            raise RuntimeError("WhatsApp API did not provide a message ID")
 
     except Exception as exc:
-        logger.exception(
-            "Outbound WhatsApp send outcome uncertain"
-        )
+        logger.exception("Outbound WhatsApp send outcome uncertain")
         mark_unknown(request_id, exc)
 
         raise HTTPException(
@@ -278,6 +258,19 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
                     (phone,),
                 )
 
+
+                cur.execute(
+                    """
+                    UPDATE bot_outbound_requests
+                    SET status = 'cancelled',
+                        updated_at = NOW()
+                    WHERE phone = %s
+                    AND status = 'pending'
+                    """,
+                    (phone,),
+                )
+
+
                 cur.execute(
                     """
                     UPDATE outbound_requests
@@ -291,17 +284,20 @@ def send_safe_reply(phone: str, payload: SafeReplyRequest):
                 )
 
     except Exception as exc:
-        logger.exception(
-            "Meta accepted message but saving failed"
+        logger.exception("Meta accepted message but saving failed")
+
+        mark_unknown(
+            request_id,
+            exc,
+            whatsapp_message_id=whatsapp_message_id,
         )
-        mark_unknown(request_id, exc)
 
         raise HTTPException(
             status_code=502,
             detail=(
-                "Meta may have accepted the message, "
-                "but database confirmation failed. "
-                "Do not resend automatically."
+                "Meta accepted the message, but database "
+                "confirmation failed. The original send "
+                "must be investigated before another attempt."
             ),
         ) from exc
 
@@ -347,9 +343,7 @@ def get_outbound_request_status(request_id: UUID):
                     detail="Outbound request not found",
                 )
 
-            message_id = request_record[
-                "whatsapp_message_id"
-            ]
+            message_id = request_record["whatsapp_message_id"]
 
             delivery_status = None
             saved_in_chat = False
@@ -367,9 +361,7 @@ def get_outbound_request_status(request_id: UUID):
                 delivery = cur.fetchone()
 
                 if delivery:
-                    delivery_status = delivery[
-                        "delivery_status"
-                    ]
+                    delivery_status = delivery["delivery_status"]
 
                 cur.execute(
                     """
@@ -383,14 +375,10 @@ def get_outbound_request_status(request_id: UUID):
                     (message_id,),
                 )
 
-                saved_in_chat = cur.fetchone()[
-                    "exists_in_chat"
-                ]
+                saved_in_chat = cur.fetchone()["exists_in_chat"]
 
     return {
-        "request_id": str(
-            request_record["request_id"]
-        ),
+        "request_id": str(request_record["request_id"]),
         "phone": request_record["phone"],
         "status": request_record["status"],
         "whatsapp_message_id": message_id,
@@ -399,4 +387,3 @@ def get_outbound_request_status(request_id: UUID):
         "created_at": request_record["created_at"],
         "updated_at": request_record["updated_at"],
     }
-
