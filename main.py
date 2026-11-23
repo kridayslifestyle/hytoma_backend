@@ -19,6 +19,7 @@ from fastapi import (
 )
 
 from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sales_management_api import router as sales_management_router
 from admin_api import router as admin_router
 from safe_reply_api import router as safe_reply_router
@@ -30,6 +31,7 @@ from db import (
     process_next_event,
     process_next_bot_outbound,
 )
+
 
 
 
@@ -117,6 +119,26 @@ app = FastAPI(
     version="1.1.0",
     lifespan=lifespan
 )
+
+
+
+allowed_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "ADMIN_ALLOWED_ORIGINS",
+        "http://localhost:5173",
+    ).split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-CSRF-Token"],
+)
+
 
 app.include_router(auth_router)
 app.include_router(admin_router)
