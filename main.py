@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sales_management_api import router as sales_management_router
 from admin_api import router as admin_router
 from safe_reply_api import router as safe_reply_router
+from marketing.api import router as marketing_router
 from delivery_status import record_delivery_statuses
 from delivery_status_api import router as delivery_status_router
 from db import (
@@ -168,6 +169,7 @@ app.include_router(sales_management_router)
 app.include_router(inbox_router)
 app.include_router(safe_reply_router)
 app.include_router(delivery_status_router)
+app.include_router(marketing_router)
 
 @app.get("/")
 def home():
