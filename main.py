@@ -30,6 +30,7 @@ from db import (
     enqueue_event,
     process_next_event,
     process_next_bot_outbound,
+    mark_stale_bot_outbounds_unknown,
 )
 
 
@@ -65,10 +66,30 @@ EXPECTED_SENDER_ID = os.getenv(
 
 # Background event processor
 
+
 async def worker_loop():
+    loop = asyncio.get_running_loop()
+    next_recovery_check = 0.0
 
     while True:
         try:
+            # Check abandoned sends on startup
+            # and every five minutes thereafter.
+            now = loop.time()
+
+            if now >= next_recovery_check:
+                recovered = await asyncio.to_thread(
+                    mark_stale_bot_outbounds_unknown
+                )
+
+                if recovered:
+                    logger.warning(
+                        "%s abandoned bot jobs require review",
+                        recovered,
+                    )
+
+                next_recovery_check = loop.time() + 300
+
             inbound_processed = await asyncio.to_thread(
                 process_next_event
             )
@@ -86,6 +107,7 @@ async def worker_loop():
         except Exception:
             logger.exception("Worker error")
             await asyncio.sleep(5)
+
 
 
 

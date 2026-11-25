@@ -66,6 +66,24 @@ ALTER TABLE leads
 ADD COLUMN IF NOT EXISTS bot_paused_at TIMESTAMPTZ;
 
 
+-- HYTOMA Revised Qualification Flow
+
+-- Property / project type selected by customer
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS project_type TEXT;
+
+-- Customer's requested automation package
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS automation_type TEXT;
+
+-- 1 = Previous qualification flow
+-- 2 = New management-approved flow
+ALTER TABLE leads
+ADD COLUMN IF NOT EXISTS flow_version
+INTEGER NOT NULL DEFAULT 1;
+
+
+
 -- 3. Salesperson directory
 CREATE TABLE IF NOT EXISTS salespeople (
     id BIGSERIAL PRIMARY KEY,
@@ -488,12 +506,16 @@ def process_next_event():
                         # Create new lead
                         if lead is None:
 
+
                             cur.execute(
                                 """
                                 INSERT INTO leads (
                                     phone,
                                     step,
                                     status,
+                                    project_type,
+                                    automation_type,
+                                    flow_version,
                                     project_status,
                                     completion_timeline,
                                     project_location,
@@ -502,14 +524,18 @@ def process_next_event():
                                     needs_admin_followup
                                 )
                                 VALUES (
-                                    %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s,
+                                    %s, %s, %s, %s,
                                     %s, %s, %s, FALSE
                                 )
-                            """,
+                                """,
                                 (
                                     phone,
                                     updated["step"],
                                     updated["status"],
+                                    updated.get("project_type"),
+                                    updated.get("automation_type"),
+                                    updated.get("flow_version", 1),
                                     updated["project_status"],
                                     updated["completion_timeline"],
                                     updated["project_location"],
@@ -518,8 +544,10 @@ def process_next_event():
                                 ),
                             )
 
+
                         # Update existing lead
                         else:
+
 
                             cur.execute(
                                 """
@@ -527,6 +555,9 @@ def process_next_event():
                                 SET
                                     step = %s,
                                     status = %s,
+                                    project_type = %s,
+                                    automation_type = %s,
+                                    flow_version = %s,
                                     project_status = %s,
                                     completion_timeline = %s,
                                     project_location = %s,
@@ -536,10 +567,13 @@ def process_next_event():
                                     ),
                                     updated_at = NOW()
                                 WHERE phone = %s
-                            """,
+                                """,
                                 (
                                     updated["step"],
                                     updated["status"],
+                                    updated.get("project_type"),
+                                    updated.get("automation_type"),
+                                    updated.get("flow_version", 1),
                                     updated["project_status"],
                                     updated["completion_timeline"],
                                     updated["project_location"],
@@ -548,6 +582,7 @@ def process_next_event():
                                     phone,
                                 ),
                             )
+
 
                             # Notify admin after qualification
                             # or customer requests a human
@@ -672,26 +707,93 @@ def mark_bot_outbound_unknown(inbound_message_id, reason):
         logger.exception("Failed to record uncertain bot send")
 
 
-
-def process_next_bot_outbound():
+def mark_stale_bot_outbounds_unknown():
     """
-    Reserve one bot reply, then coordinate sending
-    with the customer's admin takeover lock.
-    """
+    Identify bot sends abandoned after worker restart.
 
-    # PHASE 1: Reserve job and commit before Meta call.
+    Never resend automatically because Meta may
+    already have accepted the WhatsApp message.
+
+    Only jobs older than 10 minutes are affected.
+    """
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT *
-                FROM bot_outbound_requests
-                WHERE status = 'pending'
-                ORDER BY created_at, inbound_message_id
-                FOR UPDATE SKIP LOCKED
+                UPDATE bot_outbound_requests
+                SET
+                    status = 'unknown',
+                    error_summary =
+                        'Sending job exceeded 10 minutes. '
+                        'Manual delivery verification required.',
+                    updated_at = NOW()
+                WHERE status = 'sending'
+                  AND updated_at < NOW() - INTERVAL '10 minutes'
+                RETURNING inbound_message_id, phone
+                """
+            )
+
+            stale_jobs = cur.fetchall()
+
+    for job in stale_jobs:
+        logger.warning(
+            "Abandoned WhatsApp bot job: inbound=%s phone=%s",
+            job["inbound_message_id"],
+            job["phone"],
+        )
+
+    return len(stale_jobs)
+
+
+
+
+def process_next_bot_outbound():
+    """
+    Process one durable bot queue job.
+
+    Supports:
+      - One text or list response
+      - Multiple ordered responses (type='sequence')
+
+    Safety:
+      - Reserve and commit before calling Meta
+      - Serialize bot sends with admin takeover
+      - Persist each accepted outgoing message
+      - Never automatically retry an uncertain send
+    """
+
+    # PHASE 1: Reserve one pending job.
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT b.*
+                FROM bot_outbound_requests AS b
+                WHERE b.status = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM bot_outbound_requests AS earlier
+                      WHERE earlier.phone = b.phone
+                        AND earlier.status IN (
+                            'pending',
+                            'sending',
+                            'unknown'
+                        )
+                        AND (
+                            earlier.created_at,
+                            earlier.inbound_message_id
+                        ) < (
+                            b.created_at,
+                            b.inbound_message_id
+                        )
+                  )
+                ORDER BY b.created_at, b.inbound_message_id
+                FOR UPDATE OF b SKIP LOCKED
                 LIMIT 1
                 """
             )
+
 
             job = cur.fetchone()
 
@@ -713,10 +815,9 @@ def process_next_bot_outbound():
                 (inbound_id,),
             )
 
-    # PHASE 2: Coordinate with admin pause/reply.
+    # PHASE 2: Coordinate with admin takeover.
     with customer_send_guard(phone):
 
-        # Recheck the bot state AFTER acquiring the lock.
         with db_connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -743,36 +844,132 @@ def process_next_bot_outbound():
                     )
 
                     logger.info(
-                        "Cancelled reserved bot reply: inbound=%s",
+                        "Cancelled bot reply: inbound=%s",
                         inbound_id,
                     )
                     return True
 
-        # PHASE 3: Call Meta once while holding the lock.
+        # PHASE 3: Normalize outgoing messages.
         try:
-            result = send_qualification_reply(
-                phone,
-                response,
+            if response.get("type") == "sequence":
+                messages_to_send = response.get("messages")
+            else:
+                messages_to_send = [response]
+
+            if (
+                not isinstance(messages_to_send, list)
+                or not messages_to_send
+            ):
+                raise ValueError(
+                    "Bot response sequence is empty or invalid"
+                )
+
+            for item in messages_to_send:
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        "Invalid item in bot response sequence"
+                    )
+
+                if item.get("type") not in {"text", "list"}:
+                    raise ValueError(
+                        "Unsupported bot response type"
+                    )
+
+                if not item.get("body"):
+                    raise ValueError(
+                        "Bot response is missing message body"
+                    )
+
+            # PHASE 4: Send and save each message in order.
+            last_whatsapp_message_id = None
+
+            for index, message in enumerate(
+                messages_to_send,
+                start=1,
+            ):
+                result = send_qualification_reply(
+                    phone,
+                    message,
+                )
+
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        "No valid WhatsApp API response"
+                    )
+
+                sent_messages = result.get("messages") or []
+
+                if not sent_messages:
+                    raise RuntimeError(
+                        "WhatsApp response contains no message ID"
+                    )
+
+                whatsapp_message_id = sent_messages[0].get("id")
+
+                if not whatsapp_message_id:
+                    raise RuntimeError(
+                        "Missing WhatsApp message ID"
+                    )
+
+                last_whatsapp_message_id = whatsapp_message_id
+
+                # Save each successful message immediately,
+                # before attempting the next message.
+                with db_connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO chat_messages (
+                                phone,
+                                whatsapp_message_id,
+                                direction,
+                                message_type,
+                                content
+                            )
+                            VALUES (
+                                %s, %s, 'outgoing', %s, %s
+                            )
+                            ON CONFLICT (whatsapp_message_id)
+                            DO NOTHING
+                            """,
+                            (
+                                phone,
+                                whatsapp_message_id,
+                                message["type"],
+                                message["body"],
+                            ),
+                        )
+
+                logger.info(
+                    "Bot message accepted: inbound=%s part=%s",
+                    inbound_id,
+                    index,
+                )
+
+            # PHASE 5: All messages accepted.
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE bot_outbound_requests
+                        SET status = 'accepted',
+                            whatsapp_message_id = %s,
+                            error_summary = NULL,
+                            updated_at = NOW()
+                        WHERE inbound_message_id = %s
+                          AND status = 'sending'
+                        """,
+                        (
+                            last_whatsapp_message_id,
+                            inbound_id,
+                        ),
+                    )
+
+            logger.info(
+                "Bot sequence accepted: inbound=%s count=%s",
+                inbound_id,
+                len(messages_to_send),
             )
-
-            if not isinstance(result, dict):
-                raise RuntimeError(
-                    "No valid WhatsApp API response"
-                )
-
-            sent_messages = result.get("messages") or []
-
-            if not sent_messages:
-                raise RuntimeError(
-                    "WhatsApp response contains no message ID"
-                )
-
-            whatsapp_message_id = sent_messages[0].get("id")
-
-            if not whatsapp_message_id:
-                raise RuntimeError(
-                    "Missing WhatsApp message ID"
-                )
 
         except Exception as exc:
             logger.exception(
@@ -786,63 +983,5 @@ def process_next_bot_outbound():
             )
 
             return True
-
-        # PHASE 4: Persist the accepted result.
-        try:
-            with db_connect() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO chat_messages (
-                            phone,
-                            whatsapp_message_id,
-                            direction,
-                            message_type,
-                            content
-                        )
-                        VALUES (
-                            %s, %s, 'outgoing', %s, %s
-                        )
-                        ON CONFLICT (whatsapp_message_id)
-                        DO NOTHING
-                        """,
-                        (
-                            phone,
-                            whatsapp_message_id,
-                            response["type"],
-                            response["body"],
-                        ),
-                    )
-
-                    cur.execute(
-                        """
-                        UPDATE bot_outbound_requests
-                        SET status = 'accepted',
-                            whatsapp_message_id = %s,
-                            error_summary = NULL,
-                            updated_at = NOW()
-                        WHERE inbound_message_id = %s
-                          AND status = 'sending'
-                        """,
-                        (
-                            whatsapp_message_id,
-                            inbound_id,
-                        ),
-                    )
-
-            logger.info(
-                "Bot reply accepted: inbound=%s",
-                inbound_id,
-            )
-
-        except Exception as exc:
-            logger.exception(
-                "Meta accepted bot reply but saving failed"
-            )
-
-            mark_bot_outbound_unknown(
-                inbound_id,
-                exc,
-            )
 
     return True

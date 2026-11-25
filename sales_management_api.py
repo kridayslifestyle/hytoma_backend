@@ -31,7 +31,14 @@ class AssignSalesperson(BaseModel):
     salesperson_id: int = Field(gt=0)
 
 
+
 class LeadDetailsUpdate(BaseModel):
+    project_type: Optional[str] = Field(
+        default=None, max_length=100
+    )
+    automation_type: Optional[str] = Field(
+        default=None, max_length=100
+    )
     project_status: Optional[str] = Field(
         default=None, max_length=100
     )
@@ -42,8 +49,9 @@ class LeadDetailsUpdate(BaseModel):
         default=None, max_length=255
     )
     preferred_site_visit: Optional[str] = Field(
-        default=None, max_length=100
+        default=None, max_length=200
     )
+
 
 
 @router.get("/salespeople")
@@ -240,6 +248,8 @@ def edit_lead_details(
         )
 
     allowed = {
+        "project_type",
+        "automation_type",
         "project_status",
         "completion_timeline",
         "project_location",
@@ -282,6 +292,8 @@ def edit_lead_details(
                 WHERE phone = %s
                 RETURNING
                     phone,
+                    project_type,
+                    automation_type,
                     project_status,
                     completion_timeline,
                     project_location,
