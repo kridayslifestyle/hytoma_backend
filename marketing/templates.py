@@ -49,10 +49,7 @@ def get_marketing_templates():
         result = response.json()
 
         for template in result.get("data", []):
-            if (
-                template.get("category") == "MARKETING"
-                and template.get("status") == "APPROVED"
-            ):
+            if template.get("category") == "MARKETING":
                 templates.append(template)
 
         url = result.get("paging", {}).get("next")
