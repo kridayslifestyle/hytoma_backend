@@ -93,6 +93,20 @@ class CreateTemplateRequest(BaseModel):
         max_length=2048,
     )
 
+
+    # Optional custom footer for Marketing / Utility
+    footer: str = Field(
+        default="",
+        max_length=60,
+    )
+
+    # Optional CTA and Quick Reply buttons
+    buttons: list[dict] = Field(
+        default_factory=list,
+        max_length=5,
+    )
+
+
     add_security_recommendation: bool = True
 
     code_expiration_minutes: int = Field(
@@ -135,6 +149,22 @@ class CreateTemplateRequest(BaseModel):
                 "Media type and media handle "
                 "must be provided together."
             )
+
+        
+        if self.footer.strip():
+            raise ValueError(
+                "Authentication templates cannot "
+                "contain custom footers."
+            )
+
+        if self.buttons:
+            raise ValueError(
+                "Authentication templates cannot "
+                "contain custom CTA or Quick Reply buttons."
+            )
+
+
+        
 
         return self
 
@@ -203,6 +233,8 @@ def submit_marketing_template(
             category=payload.category,
             media_type=payload.media_type,
             media_handle=payload.media_handle,
+            footer=payload.footer,
+            buttons=payload.buttons,
             add_security_recommendation=(
                 payload.add_security_recommendation
             ),
