@@ -23,6 +23,8 @@ def create_marketing_template(
     category: str = "MARKETING",
     add_security_recommendation: bool = True,
     code_expiration_minutes: int = 10,
+    media_type: str | None = None,
+    media_handle: str | None = None,
 ):
     """
     Create a Meta WhatsApp message template.
@@ -111,6 +113,38 @@ def create_marketing_template(
                 "text": body.strip(),
             }
         ]
+
+    
+    # Image/video headers are available only
+    # for Marketing and Utility templates.
+    if media_type is not None or media_handle is not None:
+        if category == "AUTHENTICATION":
+            raise ValueError(
+                "Media headers are not supported for "
+                "Authentication templates."
+            )
+
+        if media_type not in {"IMAGE", "VIDEO"}:
+            raise ValueError(
+                "Media type must be IMAGE or VIDEO."
+            )
+
+        if not media_handle or not isinstance(media_handle, str):
+            raise ValueError(
+                "A valid Meta media handle is required."
+            )
+
+        components.insert(
+            0,
+            {
+                "type": "HEADER",
+                "format": media_type,
+                "example": {
+                    "header_handle": [media_handle],
+                },
+            },
+        )
+
 
     payload = {
         "name": name,

@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sales_management_api import router as sales_management_router
 from admin_api import router as admin_router
 from safe_reply_api import router as safe_reply_router
+from marketing.upload_limit import MediaUploadSizeLimitMiddleware
 from marketing.api import router as marketing_router
 from delivery_status import record_delivery_statuses
 from delivery_status_api import router as delivery_status_router
@@ -161,6 +162,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "X-CSRF-Token"],
 )
+
+app.add_middleware(MediaUploadSizeLimitMiddleware)
 
 
 app.include_router(auth_router)
