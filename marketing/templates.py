@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-WABA_ID = "926276846891984"
+WABA_ID = os.getenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "926276846891984")
 
 
 def get_marketing_templates():
