@@ -115,6 +115,7 @@ class CreateTemplateRequest(BaseModel):
         le=90,
     )
 
+    
     @model_validator(mode="after")
     def validate_template(self):
 
@@ -135,11 +136,24 @@ class CreateTemplateRequest(BaseModel):
                     "contain image or video headers."
                 )
 
-        elif not self.body.strip():
+            if self.footer.strip():
+                raise ValueError(
+                    "Authentication templates cannot "
+                    "contain custom footers."
+                )
 
-            raise ValueError(
-                "A message body is required."
-            )
+            if self.buttons:
+                raise ValueError(
+                    "Authentication templates cannot "
+                    "contain custom CTA or Quick Reply buttons."
+                )
+
+        else:
+
+            if not self.body.strip():
+                raise ValueError(
+                    "A message body is required."
+                )
 
         if (
             (self.media_type is None)
@@ -150,23 +164,8 @@ class CreateTemplateRequest(BaseModel):
                 "must be provided together."
             )
 
-        
-        if self.footer.strip():
-            raise ValueError(
-                "Authentication templates cannot "
-                "contain custom footers."
-            )
-
-        if self.buttons:
-            raise ValueError(
-                "Authentication templates cannot "
-                "contain custom CTA or Quick Reply buttons."
-            )
-
-
-        
-
         return self
+
 
 
 # --------------------------------------------------
