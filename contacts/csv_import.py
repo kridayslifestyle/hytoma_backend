@@ -8,12 +8,12 @@ from fastapi import (
 )
 
 from pydantic import BaseModel, Field, StrictBool
-
+from contacts.api import normalize_phone, ContactType
+from typing import get_args
 from auth import require_admin
 from db import db_connect
 from contacts.api import normalize_phone
 from contacts.consent import grant_consent
-
 
 router = APIRouter(
     prefix="/admin/contacts/csv",
@@ -26,10 +26,8 @@ MAX_ROWS = 5000
 
 class CSVRequest(BaseModel):
 
-    content: str = Field(
-        min_length=1,
-        max_length=1_000_000
-    )
+    content: str = Field(min_length=1, max_length=1_000_000)
+
 
 class CSVConfirmRequest(CSVRequest):
 
@@ -40,32 +38,20 @@ class CSVConfirmRequest(CSVRequest):
 # 1. PARSE AND VALIDATE CSV
 # ============================================================
 
+
 def parse_csv(content):
 
     try:
 
         reader = csv.DictReader(
-            io.StringIO(
-                content.lstrip("\ufeff"),
-                newline=""
-            ),
-            strict=True
+            io.StringIO(content.lstrip("\ufeff"), newline=""), strict=True
         )
 
-        headers = [
-            h.strip().lower()
-            for h in (reader.fieldnames or [])
-        ]
+        headers = [h.strip().lower() for h in (reader.fieldnames or [])]
 
-        if (
-            "phone" not in headers
-            or len(headers) != len(set(headers))
-        ):
+        if "phone" not in headers or len(headers) != len(set(headers)):
 
-            raise HTTPException(
-                422,
-                "CSV needs a unique phone column."
-            )
+            raise HTTPException(422, "CSV needs a unique phone column.")
 
         reader.fieldnames = headers
 
@@ -73,19 +59,12 @@ def parse_csv(content):
 
         for row in reader:
 
-            if not any(
-                v
-                for k, v in row.items()
-                if k is not None
-            ):
+            if not any(v for k, v in row.items() if k is not None):
                 continue
 
             if len(rows) >= MAX_ROWS:
 
-                raise HTTPException(
-                    422,
-                    "Maximum 5000 contacts per file."
-                )
+                raise HTTPException(422, "Maximum 5000 contacts per file.")
 
             record = {
                 "row": reader.line_num,
@@ -93,73 +72,48 @@ def parse_csv(content):
                 "name": "",
                 "location": "",
                 "tags": [],
+                "contact_type": "unclassified",
                 "error": None,
             }
 
             try:
 
                 if None in row:
-                    raise ValueError(
-                        "Extra columns in row."
-                    )
+                    raise ValueError("Extra columns in row.")
 
-                record["phone"] = normalize_phone(
-                    row.get("phone") or ""
-                )
+                record["phone"] = normalize_phone(row.get("phone") or "")
 
-                record["name"] = (
-                    row.get("name") or ""
-                ).strip()
+                record["name"] = (row.get("name") or "").strip()
 
-                record["location"] = (
-                    row.get("location") or ""
-                ).strip()
+                record["location"] = (row.get("location") or "").strip()
 
-                tags = (
-                    row.get("tags") or ""
-                ).split(",")
+                tags = (row.get("tags") or "").split(",")
 
-                tags = list(
-                    dict.fromkeys(
-                        t.strip()
-                        for t in tags
-                        if t.strip()
-                    )
-                )
+                tags = list(dict.fromkeys(t.strip() for t in tags if t.strip()))
 
-                if (
-                    len(record["name"]) > 150
-                    or len(record["location"]) > 255
-                ):
+                if len(record["name"]) > 150 or len(record["location"]) > 255:
 
-                    raise ValueError(
-                        "Name or location too long."
-                    )
+                    raise ValueError("Name or location too long.")
 
-                if (
-                    len(tags) > 20
-                    or any(len(t) > 80 for t in tags)
-                ):
+                if len(tags) > 20 or any(len(t) > 80 for t in tags):
 
-                    raise ValueError(
-                        "Maximum 20 tags, "
-                        "80 characters each."
-                    )
+                    raise ValueError("Maximum 20 tags, " "80 characters each.")
 
                 if any(
-                    "\x00" in v
-                    for v in [
-                        record["name"],
-                        record["location"],
-                        *tags
-                    ]
+                    "\x00" in v for v in [record["name"], record["location"], *tags]
                 ):
 
-                    raise ValueError(
-                        "Invalid null character."
-                    )
+                    raise ValueError("Invalid null character.")
 
                 record["tags"] = tags
+                category = (row.get("contact_type") or "").strip().lower().replace(
+                    " ", "_"
+                ) or "unclassified"
+
+                if category not in get_args(ContactType):
+                    raise ValueError("Invalid contact_type.")
+
+                record["contact_type"] = category
 
             except ValueError as exc:
 
@@ -169,43 +123,34 @@ def parse_csv(content):
 
         if not rows:
 
-            raise HTTPException(
-                422,
-                "CSV has no contact rows."
-            )
+            raise HTTPException(422, "CSV has no contact rows.")
 
         return rows
 
     except csv.Error as exc:
 
-        raise HTTPException(
-            422,
-            "Invalid CSV format."
-        ) from exc
+        raise HTTPException(422, "Invalid CSV format.") from exc
 
 
 # ============================================================
 # 2. CLASSIFY VALID, DUPLICATE AND INVALID CONTACTS
 # ============================================================
 
+
 def classify(cur, rows):
 
-    phones = list({
-        r["phone"]
-        for r in rows
-        if not r["error"]
-    })
+    phones = list({r["phone"] for r in rows if not r["error"]})
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT phone
         FROM contacts
         WHERE phone = ANY(%s)
-    """, (phones,))
+    """,
+        (phones,),
+    )
 
-    existing = {
-        r["phone"]
-        for r in cur.fetchall()
-    }
+    existing = {r["phone"] for r in cur.fetchall()}
 
     seen = set()
 
@@ -222,17 +167,11 @@ def classify(cur, rows):
 
             status = "invalid"
 
-        elif (
-            r["phone"] in existing
-            or r["phone"] in seen
-        ):
+        elif r["phone"] in existing or r["phone"] in seen:
 
             status = "duplicate"
 
-            r["error"] = (
-                "Phone already exists "
-                "or repeats in file."
-            )
+            r["error"] = "Phone already exists " "or repeats in file."
 
         else:
 
@@ -251,6 +190,7 @@ def classify(cur, rows):
 # ============================================================
 # 3. PREVIEW CSV IMPORT
 # ============================================================
+
 
 @router.post("/preview")
 def preview_csv(payload: CSVRequest):
@@ -273,6 +213,7 @@ def preview_csv(payload: CSVRequest):
 # 4. CONFIRM CSV IMPORT
 # ============================================================
 
+
 @router.post("/confirm")
 def confirm_csv(payload: CSVConfirmRequest):
 
@@ -294,34 +235,29 @@ def confirm_csv(payload: CSVConfirmRequest):
                 if r["status"] != "valid":
                     continue
 
-                cur.execute("""
-                    INSERT INTO contacts (
-                        phone,
-                        name,
-                        location,
-                        source,
-                        tags
-                    )
-
-                    VALUES (
-                        %s,
-                        %s,
-                        %s,
-                        'csv',
-                        %s
-                    )
-
-                    ON CONFLICT (phone)
-                    DO NOTHING
-
-                    RETURNING id
-
-                """, (
-                    r["phone"],
-                    r["name"],
-                    r["location"],
-                    r["tags"],
-                ))
+                cur.execute(
+                    """
+    INSERT INTO contacts (
+        phone,
+        name,
+        location,
+        source,
+        tags,
+        contact_type
+    )
+    VALUES (%s, %s, %s, 'csv', %s, %s)
+    ON CONFLICT (phone)
+    DO NOTHING
+    RETURNING id
+""",
+                    (
+                        r["phone"],
+                        r["name"],
+                        r["location"],
+                        r["tags"],
+                        r["contact_type"],
+                    ),
+                )
 
                 inserted = cur.fetchone()
 
@@ -339,11 +275,7 @@ def confirm_csv(payload: CSVConfirmRequest):
 
             if payload.confirmed_opt_in and new_ids:
 
-                opted_in = grant_consent(
-                    cur,
-                    new_ids,
-                    "csv_admin_verified"
-                )
+                opted_in = grant_consent(cur, new_ids, "csv_admin_verified")
 
             return {
                 "added": added,

@@ -1,5 +1,5 @@
 import re
-
+from typing import Literal
 from fastapi import (
     APIRouter,
     Depends,
@@ -56,6 +56,23 @@ CREATE TABLE IF NOT EXISTS contacts (
 
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE contacts
+ADD COLUMN IF NOT EXISTS contact_type TEXT
+NOT NULL DEFAULT 'unclassified'
+CHECK (
+    contact_type IN (
+        'unclassified',
+        'customer',
+        'interior_designer',
+        'builder',
+        'architect',
+        'other'
+    )
+);
+
+CREATE INDEX IF NOT EXISTS contacts_type_idx
+ON contacts(contact_type);
 
 
 CREATE INDEX IF NOT EXISTS contacts_consent_idx
@@ -123,46 +140,29 @@ def normalize_phone(value: str) -> str:
 # ============================================================
 # 3. REQUEST MODELS
 # ============================================================
+ContactType = Literal[
+    "unclassified",
+    "customer",
+    "interior_designer",
+    "builder",
+    "architect",
+    "other",
+]
+
 
 class ContactCreate(BaseModel):
-
-    phone: str = Field(
-        min_length=1,
-        max_length=40
-    )
-
-    name: str = Field(
-        default="",
-        max_length=150
-    )
-
-    location: str = Field(
-        default="",
-        max_length=255
-    )
-
-    tags: list[str] = Field(
-        default_factory=list,
-        max_length=20
-    )
+    phone: str = Field(min_length=1, max_length=40)
+    name: str = Field(default="", max_length=150)
+    location: str = Field(default="", max_length=255)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    contact_type: ContactType = "unclassified"
 
 
 class ContactUpdate(BaseModel):
-
-    name: str = Field(
-        default="",
-        max_length=150
-    )
-
-    location: str = Field(
-        default="",
-        max_length=255
-    )
-
-    tags: list[str] = Field(
-        default_factory=list,
-        max_length=20
-    )
+    name: str = Field(default="", max_length=150)
+    location: str = Field(default="", max_length=255)
+    tags: list[str] = Field(default_factory=list, max_length=20)
+    contact_type: ContactType | None = None
 
 
 # ============================================================
@@ -195,59 +195,40 @@ def clean_tags(tags):
 
 @router.get("")
 def list_contacts(
-
-    search: str = Query(
-        default="",
-        max_length=150
-    ),
-
+    search: str = Query(default="", max_length=150),
     consent_status: str = Query(
         default="all",
-        pattern="^(all|pending|opted_in|opted_out)$"
+        pattern="^(all|pending|opted_in|opted_out)$",
     ),
-
-    limit: int = Query(
-        default=50,
-        ge=1,
-        le=200
+    contact_type: str = Query(
+        default="all",
+        pattern="^(all|unclassified|customer|interior_designer|builder|architect|other)$",
     ),
-
-    offset: int = Query(
-        default=0,
-        ge=0
-    ),
+    tag: str = Query(default="", max_length=80),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ):
-
     term = "%" + search.strip() + "%"
 
     with db_connect() as conn:
-
         with conn.cursor() as cur:
-
-            # Overall contact statistics
 
             cur.execute("""
                 SELECT
                     COUNT(*) AS total,
-
                     COUNT(*) FILTER (
-                        WHERE consent_status = 'pending'
+                        WHERE consent_status='pending'
                     ) AS pending,
-
                     COUNT(*) FILTER (
-                        WHERE consent_status = 'opted_in'
+                        WHERE consent_status='opted_in'
                     ) AS opted_in,
-
                     COUNT(*) FILTER (
-                        WHERE consent_status = 'opted_out'
+                        WHERE consent_status='opted_out'
                     ) AS opted_out
-
                 FROM contacts
             """)
 
             stats = cur.fetchone()
-
-            # Search and consent filtering
 
             where = """
                 WHERE (
@@ -255,10 +236,15 @@ def list_contacts(
                     OR phone ILIKE %s
                     OR location ILIKE %s
                 )
-
+                AND (%s = 'all' OR consent_status = %s)
+                AND (%s = 'all' OR contact_type = %s)
                 AND (
-                    %s = 'all'
-                    OR consent_status = %s
+                    %s = ''
+                    OR EXISTS (
+                        SELECT 1
+                        FROM unnest(tags) AS t(value)
+                        WHERE lower(t.value) = lower(%s)
+                    )
                 )
             """
 
@@ -268,36 +254,27 @@ def list_contacts(
                 term,
                 consent_status,
                 consent_status,
+                contact_type,
+                contact_type,
+                tag.strip(),
+                tag.strip(),
             )
 
-            # Count filtered results
-
             cur.execute(
-                "SELECT COUNT(*) AS total FROM contacts "
-                + where,
-
-                params
+                "SELECT COUNT(*) AS total FROM contacts " + where,
+                params,
             )
 
             total = cur.fetchone()["total"]
 
-            # Load paginated contacts
-
             cur.execute(
-                "SELECT * FROM contacts "
-                + where
-                + """
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT %s OFFSET %s
-                """,
-
-                (*params, limit, offset)
+                "SELECT * FROM contacts " + where +
+                " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
+                (*params, limit, offset),
             )
 
-            contacts = cur.fetchall()
-
             return {
-                "contacts": contacts,
+                "contacts": cur.fetchall(),
                 "total": total,
                 "stats": stats,
             }
@@ -311,20 +288,13 @@ def list_contacts(
 def create_contact(payload: ContactCreate):
 
     try:
-
         phone = normalize_phone(payload.phone)
-
     except ValueError as exc:
-
-        raise HTTPException(
-            status_code=422,
-            detail=str(exc)
-        ) from exc
+        raise HTTPException(422, str(exc)) from exc
 
     tags = clean_tags(payload.tags)
 
     with db_connect() as conn:
-
         with conn.cursor() as cur:
 
             cur.execute("""
@@ -333,40 +303,30 @@ def create_contact(payload: ContactCreate):
                     name,
                     location,
                     source,
-                    tags
+                    tags,
+                    contact_type
                 )
-
-                VALUES (
-                    %s,
-                    %s,
-                    %s,
-                    'manual',
-                    %s
-                )
-
+                VALUES (%s, %s, %s, 'manual', %s, %s)
                 ON CONFLICT (phone)
                 DO NOTHING
-
                 RETURNING *
             """, (
                 phone,
                 payload.name.strip(),
                 payload.location.strip(),
                 tags,
+                payload.contact_type,
             ))
 
             contact = cur.fetchone()
 
             if not contact:
-
                 raise HTTPException(
-                    status_code=409,
-                    detail="This contact already exists."
+                    409,
+                    "This contact already exists.",
                 )
 
-            return {
-                "contact": contact
-            }
+            return {"contact": contact}
 
 
 # ============================================================
@@ -376,48 +336,40 @@ def create_contact(payload: ContactCreate):
 @router.patch("/{contact_id}")
 def update_contact(
     contact_id: int,
-    payload: ContactUpdate
+    payload: ContactUpdate,
 ):
-
     tags = clean_tags(payload.tags)
 
     with db_connect() as conn:
-
         with conn.cursor() as cur:
 
             cur.execute("""
                 UPDATE contacts
-
                 SET
                     name = %s,
                     location = %s,
                     tags = %s,
+                    contact_type = COALESCE(%s, contact_type),
                     updated_at = NOW()
-
                 WHERE id = %s
-
                 RETURNING *
             """, (
                 payload.name.strip(),
                 payload.location.strip(),
                 tags,
+                payload.contact_type,
                 contact_id,
             ))
 
             contact = cur.fetchone()
 
             if not contact:
-
                 raise HTTPException(
-                    status_code=404,
-                    detail="Contact not found."
+                    404,
+                    "Contact not found.",
                 )
 
-            return {
-                "contact": contact
-            }
-
-
+            return {"contact": contact}
 # ============================================================
 # 8. IMPORT EXISTING CRM LEADS
 # ============================================================
@@ -529,4 +481,47 @@ def sync_crm_contacts():
         "added": added,
         "existing": existing,
         "invalid": invalid,
+    }
+
+class BulkContactType(BaseModel):
+    contact_ids: list[int] = Field(
+        min_length=1,
+        max_length=5000,
+    )
+    contact_type: ContactType
+
+
+@router.post("/bulk-type")
+def bulk_contact_type(payload: BulkContactType):
+
+    ids = list(set(payload.contact_ids))
+
+    if any(i <= 0 for i in ids):
+        raise HTTPException(
+            422,
+            "Invalid contact ID.",
+        )
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                UPDATE contacts
+                SET
+                    contact_type = %s,
+                    updated_at = NOW()
+                WHERE id = ANY(%s)
+                AND contact_type <> %s
+                RETURNING id
+            """, (
+                payload.contact_type,
+                ids,
+                payload.contact_type,
+            ))
+
+            updated = len(cur.fetchall())
+
+    return {
+        "updated": updated,
+        "skipped": len(ids) - updated,
     }
