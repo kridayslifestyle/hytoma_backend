@@ -51,6 +51,12 @@ from campaigns.send_test import (
     initialize_campaign_test_send,
 )
 
+from campaigns.bulk import (
+    router as campaign_queue_router,
+    initialize_campaign_queue,
+    campaign_worker_loop,
+)
+
 load_dotenv()
 
 logging.basicConfig(
@@ -122,19 +128,36 @@ async def lifespan(app: FastAPI):
 
     await asyncio.to_thread(initialize_campaign_test_send)
 
+    await asyncio.to_thread(initialize_campaign_queue)
+
     worker = asyncio.create_task(worker_loop())
+
+    campaign_worker = asyncio.create_task(campaign_worker_loop())
 
     try:
         yield
 
     finally:
+
         worker.cancel()
 
-        try:
-            await worker
+        campaign_worker.cancel()
 
-        except asyncio.CancelledError:
-            pass
+    try:
+
+        await worker
+
+    except asyncio.CancelledError:
+
+        pass
+
+    try:
+
+        await campaign_worker
+
+    except asyncio.CancelledError:
+
+        pass
 
 
 app = FastAPI(
@@ -175,6 +198,7 @@ app.include_router(contacts_consent_router)
 app.include_router(campaigns_router)
 app.include_router(campaign_content_router)
 app.include_router(campaign_test_send_router)
+app.include_router(campaign_queue_router)
 
 
 @app.get("/")
