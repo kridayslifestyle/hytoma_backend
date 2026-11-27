@@ -245,32 +245,28 @@ def get_draft(
 
 @router.get("/{campaign_id}/content")
 def get_content(campaign_id: int):
-
     with db_connect() as conn:
-
         with conn.cursor() as cur:
-
-            row = get_draft(
-                cur,
-                campaign_id,
+            cur.execute(
+                "SELECT * FROM marketing_campaigns WHERE id=%s",
+                (campaign_id,),
             )
 
+            row = cur.fetchone()
+
+            if not row:
+                raise HTTPException(
+                    404,
+                    "Campaign not found."
+                )
+
     return {
-
-        **requirements(
-            row["template_snapshot"]
-        ),
-
+        **requirements(row["template_snapshot"]),
         "values": row["template_values"],
-
         "media_id": row["media_id"],
-
         "media_type": row["media_type"],
-
         "media_filename": row["media_filename"],
-
         "media_uploaded_at": row["media_uploaded_at"],
-
     }
 
 
