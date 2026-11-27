@@ -41,6 +41,11 @@ from campaigns.api import (
     initialize_campaigns,
 )
 
+from campaigns.content import (
+    router as campaign_content_router,
+    initialize_campaign_content,
+)
+
 load_dotenv()
 
 logging.basicConfig(
@@ -108,6 +113,8 @@ async def lifespan(app: FastAPI):
 
     await asyncio.to_thread(initialize_campaigns)
 
+    await asyncio.to_thread(initialize_campaign_content)
+
     worker = asyncio.create_task(worker_loop())
 
     try:
@@ -159,6 +166,7 @@ app.include_router(contacts_router)
 app.include_router(contacts_csv_router)
 app.include_router(contacts_consent_router)
 app.include_router(campaigns_router)
+app.include_router(campaign_content_router)
 
 
 @app.get("/")

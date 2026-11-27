@@ -1,9 +1,10 @@
-
 """HYTOMA Marketing — upload request size protection."""
 
 MAX_UPLOAD_REQUEST_BYTES = 17 * 1024 * 1024
 
 UPLOAD_PATH = "/admin/marketing/media/upload"
+
+import re
 
 
 class MediaUploadSizeLimitMiddleware:
@@ -19,7 +20,13 @@ class MediaUploadSizeLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if (
             scope["type"] != "http"
-            or scope.get("path") != UPLOAD_PATH
+            or not (
+                scope.get("path") == UPLOAD_PATH
+                or re.fullmatch(
+                    r"/admin/campaigns/[0-9]+/media",
+                    scope.get("path", ""),
+                )
+            )
             or scope.get("method") != "POST"
         ):
             await self.app(scope, receive, send)
@@ -83,16 +90,20 @@ class MediaUploadSizeLimitMiddleware:
     async def reject(send, status, message):
         data = message.encode("utf-8")
 
-        await send({
-            "type": "http.response.start",
-            "status": status,
-            "headers": [
-                (b"content-type", b"text/plain; charset=utf-8"),
-                (b"content-length", str(len(data)).encode()),
-            ],
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", str(len(data)).encode()),
+                ],
+            }
+        )
 
-        await send({
-            "type": "http.response.body",
-            "body": data,
-        })
+        await send(
+            {
+                "type": "http.response.body",
+                "body": data,
+            }
+        )
