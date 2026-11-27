@@ -57,6 +57,8 @@ from campaigns.bulk import (
     campaign_worker_loop,
 )
 
+from campaigns.reports import router as campaign_reports_router
+
 load_dotenv()
 
 logging.basicConfig(
@@ -199,7 +201,7 @@ app.include_router(campaigns_router)
 app.include_router(campaign_content_router)
 app.include_router(campaign_test_send_router)
 app.include_router(campaign_queue_router)
-
+app.include_router(campaign_reports_router)
 
 @app.get("/")
 def home():
