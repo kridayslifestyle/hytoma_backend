@@ -59,6 +59,11 @@ from campaigns.bulk import (
 
 from campaigns.reports import router as campaign_reports_router
 
+from marketing_inbox.api import (
+    router as marketing_inbox_router,
+    initialize_marketing_inbox,
+)
+
 load_dotenv()
 
 logging.basicConfig(
@@ -132,6 +137,8 @@ async def lifespan(app: FastAPI):
 
     await asyncio.to_thread(initialize_campaign_queue)
 
+    await asyncio.to_thread(initialize_marketing_inbox)
+
     worker = asyncio.create_task(worker_loop())
 
     campaign_worker = asyncio.create_task(campaign_worker_loop())
@@ -202,6 +209,8 @@ app.include_router(campaign_content_router)
 app.include_router(campaign_test_send_router)
 app.include_router(campaign_queue_router)
 app.include_router(campaign_reports_router)
+app.include_router(marketing_inbox_router)
+
 
 @app.get("/")
 def home():
@@ -365,6 +374,7 @@ async def receive_webhook(request: Request):
                     sender_id,
                     ad_id,
                     display_content,
+                    (msg.get("context") or {}).get("id"),
                 )
 
     return {"status": "received"}

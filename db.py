@@ -289,6 +289,7 @@ def enqueue_event(
     sender_number_id,
     ad_id,
     display_content=None,
+    context_id=None,
 ):
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -323,6 +324,18 @@ def enqueue_event(
                 message_text,
                 display_content
             )
+
+            from marketing_inbox.api import route_campaign_reply
+
+            if route_campaign_reply(
+                cur,
+                message_id,
+                phone,
+                context_id,
+                ad_id,
+                display_content or message_text,
+            ):
+                return True
 
             # Preserve message for admin inbox
             cur.execute(
