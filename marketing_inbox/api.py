@@ -50,12 +50,129 @@ def route_campaign_reply(
     ad_id,
     display_text,
 ):
-    # Only route replies that explicitly reference
-    # a previously accepted campaign message.
-    # New ad enquiries retain the existing bot flow.
 
-    if not context_id or ad_id:
+    # RULE 1:
+    # New Click-to-WhatsApp ad enquiries
+    # must follow the existing lead bot.
+
+    if ad_id:
         return False
+
+
+    # RULE 2:
+    # Check whether the customer explicitly
+    # replied to a campaign message.
+
+    if context_id:
+
+        cur.execute("""
+            SELECT
+                r.campaign_id,
+                r.contact_id
+
+            FROM campaign_recipients r
+
+            JOIN contacts c
+                ON c.id = r.contact_id
+
+            WHERE r.wamid = %s
+              AND c.phone = %s
+              AND r.send_status = 'accepted'
+
+        """, (
+            context_id,
+            phone,
+        ))
+
+
+    # RULE 3:
+    # If the customer sends a normal message,
+    # find recent eligible marketing activity.
+
+    else:
+
+        cur.execute("""
+            SELECT
+                r.campaign_id,
+                r.contact_id
+
+            FROM campaign_recipients r
+
+            JOIN contacts c
+                ON c.id = r.contact_id
+
+            LEFT JOIN whatsapp_message_statuses s
+                ON s.whatsapp_message_id = r.wamid
+
+            LEFT JOIN LATERAL (
+
+                SELECT
+                    MAX(e.created_at) AS last_reply
+
+                FROM marketing_replies m
+
+                JOIN inbound_events e
+                    ON e.message_id = m.message_id
+
+                WHERE m.campaign_id = r.campaign_id
+                  AND m.contact_id = r.contact_id
+
+            ) replies ON TRUE
+
+            WHERE c.phone = %s
+
+              AND r.send_status = 'accepted'
+
+              AND r.wamid IS NOT NULL
+
+              AND COALESCE(
+                    s.delivery_status,
+                    'accepted'
+                  ) <> 'failed'
+
+              AND GREATEST(
+                    r.attempted_at,
+                    replies.last_reply
+                  ) >= NOW() - INTERVAL '24 hours'
+
+              AND NOT EXISTS (
+
+                  SELECT 1
+
+                  FROM inbound_events e
+
+                  WHERE e.phone = c.phone
+
+                    AND e.ad_id IS NOT NULL
+
+                    AND e.created_at >= GREATEST(
+                        r.attempted_at,
+                        replies.last_reply
+                    )
+              )
+
+            ORDER BY GREATEST(
+                r.attempted_at,
+                replies.last_reply
+            ) DESC,
+
+            r.campaign_id DESC
+
+            LIMIT 1
+
+        """, (phone,))
+
+
+    # If there is no matching campaign,
+    # continue with the existing qualification bot.
+
+    target = cur.fetchone()
+
+    if not target:
+        return False
+
+
+    # Store the message in Marketing Inbox.
 
     cur.execute("""
         INSERT INTO marketing_replies (
@@ -65,20 +182,7 @@ def route_campaign_reply(
             display_text
         )
 
-        SELECT
-            %s,
-            r.campaign_id,
-            r.contact_id,
-            %s
-
-        FROM campaign_recipients r
-
-        JOIN contacts c
-            ON c.id = r.contact_id
-
-        WHERE r.wamid = %s
-          AND c.phone = %s
-          AND r.send_status = 'accepted'
+        VALUES (%s, %s, %s, %s)
 
         ON CONFLICT (message_id)
         DO NOTHING
@@ -87,16 +191,17 @@ def route_campaign_reply(
 
     """, (
         message_id,
+        target["campaign_id"],
+        target["contact_id"],
         display_text,
-        context_id,
-        phone,
     ))
 
     if not cur.fetchone():
         return False
 
-    # Prevent the qualification bot from processing
-    # this explicitly linked marketing reply.
+
+    # Mark the inbound event as processed
+    # so the qualification bot does not handle it.
 
     cur.execute("""
         UPDATE inbound_events
