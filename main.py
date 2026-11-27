@@ -40,7 +40,7 @@ from contacts.api import (
 )
 from contacts.csv_import import router as contacts_csv_router
 
-
+from contacts.consent import router as contacts_consent_router
 
 
 
@@ -184,6 +184,7 @@ app.include_router(delivery_status_router)
 app.include_router(marketing_router)
 app.include_router(contacts_router)
 app.include_router(contacts_csv_router)
+app.include_router(contacts_consent_router)
 
 @app.get("/")
 def home():

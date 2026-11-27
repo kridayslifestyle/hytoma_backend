@@ -16,6 +16,8 @@ from qualification import (
 )
 from whatsapp_service import send_qualification_reply
 
+
+
 logger = logging.getLogger("hytoma")
 
 
@@ -312,6 +314,15 @@ def enqueue_event(
 
             if not inserted:
                 return False
+
+            from contacts.consent import record_inbound_opt_out
+
+            record_inbound_opt_out(
+                cur,
+                phone,
+                message_text,
+                display_content
+            )
 
             # Preserve message for admin inbox
             cur.execute(

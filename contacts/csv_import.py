@@ -7,11 +7,12 @@ from fastapi import (
     HTTPException,
 )
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from auth import require_admin
 from db import db_connect
 from contacts.api import normalize_phone
+from contacts.consent import grant_consent
 
 
 router = APIRouter(
@@ -29,6 +30,10 @@ class CSVRequest(BaseModel):
         min_length=1,
         max_length=1_000_000
     )
+
+class CSVConfirmRequest(CSVRequest):
+
+    confirmed_opt_in: StrictBool = False
 
 
 # ============================================================
@@ -269,7 +274,7 @@ def preview_csv(payload: CSVRequest):
 # ============================================================
 
 @router.post("/confirm")
-def confirm_csv(payload: CSVRequest):
+def confirm_csv(payload: CSVConfirmRequest):
 
     rows = parse_csv(payload.content)
 
@@ -282,6 +287,7 @@ def confirm_csv(payload: CSVRequest):
             counts = classify(cur, rows)
 
             added = 0
+            new_ids = []
 
             for r in rows:
 
@@ -317,16 +323,31 @@ def confirm_csv(payload: CSVRequest):
                     r["tags"],
                 ))
 
-                if cur.fetchone():
+                inserted = cur.fetchone()
+
+                if inserted:
 
                     added += 1
+
+                    new_ids.append(inserted["id"])
 
                 else:
 
                     counts["duplicate"] += 1
 
+            opted_in = 0
+
+            if payload.confirmed_opt_in and new_ids:
+
+                opted_in = grant_consent(
+                    cur,
+                    new_ids,
+                    "csv_admin_verified"
+                )
+
             return {
                 "added": added,
                 "duplicates": counts["duplicate"],
                 "invalid": counts["invalid"],
+                "opted_in": opted_in,
             }
