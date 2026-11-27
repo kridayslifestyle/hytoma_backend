@@ -1,0 +1,532 @@
+import re
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+)
+
+from pydantic import BaseModel, Field
+
+from auth import require_admin
+from db import db_connect
+
+
+router = APIRouter(
+    prefix="/admin/contacts",
+    tags=["Contacts Manager"],
+    dependencies=[Depends(require_admin)],
+)
+
+
+# ============================================================
+# 1. DATABASE SCHEMA
+# ============================================================
+
+CONTACTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS contacts (
+    id BIGSERIAL PRIMARY KEY,
+
+    phone TEXT NOT NULL UNIQUE,
+
+    name VARCHAR(150) NOT NULL DEFAULT '',
+
+    location VARCHAR(255) NOT NULL DEFAULT '',
+
+    source TEXT NOT NULL
+        CHECK (source IN ('manual', 'crm', 'csv')),
+
+    tags TEXT[] NOT NULL DEFAULT '{}',
+
+    consent_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (
+            consent_status IN (
+                'pending',
+                'opted_in',
+                'opted_out'
+            )
+        ),
+
+    consent_at TIMESTAMPTZ,
+
+    consent_source TEXT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+CREATE INDEX IF NOT EXISTS contacts_consent_idx
+ON contacts(consent_status);
+
+
+CREATE TABLE IF NOT EXISTS contact_consent_events (
+    id BIGSERIAL PRIMARY KEY,
+
+    contact_id BIGINT NOT NULL
+        REFERENCES contacts(id),
+
+    status TEXT NOT NULL
+        CHECK (status IN ('opted_in', 'opted_out')),
+
+    source TEXT NOT NULL,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+
+def initialize_contacts():
+
+    with db_connect() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                CONTACTS_SCHEMA,
+                prepare=False
+            )
+
+
+# ============================================================
+# 2. PHONE NUMBER NORMALIZATION
+# ============================================================
+
+def normalize_phone(value: str) -> str:
+
+    phone = re.sub(
+        r"[\s()\-]",
+        "",
+        value.strip()
+    )
+
+    if phone.startswith("+"):
+
+        phone = phone[1:]
+
+    elif re.fullmatch(r"[6-9][0-9]{9}", phone):
+
+        # Default country code for Indian mobile numbers
+        phone = "91" + phone
+
+    if not re.fullmatch(r"[1-9][0-9]{7,14}", phone):
+
+        raise ValueError(
+            "Enter a valid phone number with country code."
+        )
+
+    return phone
+
+
+# ============================================================
+# 3. REQUEST MODELS
+# ============================================================
+
+class ContactCreate(BaseModel):
+
+    phone: str = Field(
+        min_length=1,
+        max_length=40
+    )
+
+    name: str = Field(
+        default="",
+        max_length=150
+    )
+
+    location: str = Field(
+        default="",
+        max_length=255
+    )
+
+    tags: list[str] = Field(
+        default_factory=list,
+        max_length=20
+    )
+
+
+class ContactUpdate(BaseModel):
+
+    name: str = Field(
+        default="",
+        max_length=150
+    )
+
+    location: str = Field(
+        default="",
+        max_length=255
+    )
+
+    tags: list[str] = Field(
+        default_factory=list,
+        max_length=20
+    )
+
+
+# ============================================================
+# 4. NORMALIZE TAGS
+# ============================================================
+
+def clean_tags(tags):
+
+    cleaned = list(
+        dict.fromkeys(
+            t.strip()
+            for t in tags
+            if t.strip()
+        )
+    )
+
+    if any(len(t) > 80 for t in cleaned):
+
+        raise HTTPException(
+            status_code=422,
+            detail="Tags must not exceed 80 characters."
+        )
+
+    return cleaned
+
+
+# ============================================================
+# 5. GET CONTACTS AND STATISTICS
+# ============================================================
+
+@router.get("")
+def list_contacts(
+
+    search: str = Query(
+        default="",
+        max_length=150
+    ),
+
+    consent_status: str = Query(
+        default="all",
+        pattern="^(all|pending|opted_in|opted_out)$"
+    ),
+
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=200
+    ),
+
+    offset: int = Query(
+        default=0,
+        ge=0
+    ),
+):
+
+    term = "%" + search.strip() + "%"
+
+    with db_connect() as conn:
+
+        with conn.cursor() as cur:
+
+            # Overall contact statistics
+
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+
+                    COUNT(*) FILTER (
+                        WHERE consent_status = 'pending'
+                    ) AS pending,
+
+                    COUNT(*) FILTER (
+                        WHERE consent_status = 'opted_in'
+                    ) AS opted_in,
+
+                    COUNT(*) FILTER (
+                        WHERE consent_status = 'opted_out'
+                    ) AS opted_out
+
+                FROM contacts
+            """)
+
+            stats = cur.fetchone()
+
+            # Search and consent filtering
+
+            where = """
+                WHERE (
+                    name ILIKE %s
+                    OR phone ILIKE %s
+                    OR location ILIKE %s
+                )
+
+                AND (
+                    %s = 'all'
+                    OR consent_status = %s
+                )
+            """
+
+            params = (
+                term,
+                term,
+                term,
+                consent_status,
+                consent_status,
+            )
+
+            # Count filtered results
+
+            cur.execute(
+                "SELECT COUNT(*) AS total FROM contacts "
+                + where,
+
+                params
+            )
+
+            total = cur.fetchone()["total"]
+
+            # Load paginated contacts
+
+            cur.execute(
+                "SELECT * FROM contacts "
+                + where
+                + """
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s OFFSET %s
+                """,
+
+                (*params, limit, offset)
+            )
+
+            contacts = cur.fetchall()
+
+            return {
+                "contacts": contacts,
+                "total": total,
+                "stats": stats,
+            }
+
+
+# ============================================================
+# 6. CREATE CONTACT MANUALLY
+# ============================================================
+
+@router.post("", status_code=201)
+def create_contact(payload: ContactCreate):
+
+    try:
+
+        phone = normalize_phone(payload.phone)
+
+    except ValueError as exc:
+
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc)
+        ) from exc
+
+    tags = clean_tags(payload.tags)
+
+    with db_connect() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                INSERT INTO contacts (
+                    phone,
+                    name,
+                    location,
+                    source,
+                    tags
+                )
+
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    'manual',
+                    %s
+                )
+
+                ON CONFLICT (phone)
+                DO NOTHING
+
+                RETURNING *
+            """, (
+                phone,
+                payload.name.strip(),
+                payload.location.strip(),
+                tags,
+            ))
+
+            contact = cur.fetchone()
+
+            if not contact:
+
+                raise HTTPException(
+                    status_code=409,
+                    detail="This contact already exists."
+                )
+
+            return {
+                "contact": contact
+            }
+
+
+# ============================================================
+# 7. EDIT CONTACT DETAILS
+# ============================================================
+
+@router.patch("/{contact_id}")
+def update_contact(
+    contact_id: int,
+    payload: ContactUpdate
+):
+
+    tags = clean_tags(payload.tags)
+
+    with db_connect() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                UPDATE contacts
+
+                SET
+                    name = %s,
+                    location = %s,
+                    tags = %s,
+                    updated_at = NOW()
+
+                WHERE id = %s
+
+                RETURNING *
+            """, (
+                payload.name.strip(),
+                payload.location.strip(),
+                tags,
+                contact_id,
+            ))
+
+            contact = cur.fetchone()
+
+            if not contact:
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Contact not found."
+                )
+
+            return {
+                "contact": contact
+            }
+
+
+# ============================================================
+# 8. IMPORT EXISTING CRM LEADS
+# ============================================================
+
+@router.post("/sync-crm")
+def sync_crm_contacts():
+
+    added = 0
+    existing = 0
+    invalid = 0
+
+    with db_connect() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute("""
+                SELECT
+                    phone,
+                    project_location,
+                    status
+
+                FROM leads
+            """)
+
+            leads = cur.fetchall()
+
+            for lead in leads:
+
+                try:
+
+                    phone = normalize_phone(
+                        lead["phone"]
+                    )
+
+                except (ValueError, AttributeError):
+
+                    invalid += 1
+                    continue
+
+                cur.execute("""
+                    INSERT INTO contacts (
+                        phone,
+                        location,
+                        source
+                    )
+
+                    VALUES (
+                        %s,
+                        %s,
+                        'crm'
+                    )
+
+                    ON CONFLICT (phone)
+                    DO NOTHING
+
+                    RETURNING id
+                """, (
+                    phone,
+                    (lead["project_location"] or "")[:255],
+                ))
+
+                if cur.fetchone():
+
+                    added += 1
+
+                else:
+
+                    existing += 1
+
+                # Preserve existing CRM opt-out requests
+
+                if lead["status"] == "opted_out":
+
+                    cur.execute("""
+                        UPDATE contacts
+
+                        SET
+                            consent_status = 'opted_out',
+                            consent_at = NOW(),
+                            consent_source = 'crm_opt_out',
+                            updated_at = NOW()
+
+                        WHERE phone = %s
+
+                        AND consent_status <> 'opted_out'
+
+                        RETURNING id
+                    """, (phone,))
+
+                    changed = cur.fetchone()
+
+                    if changed:
+
+                        cur.execute("""
+                            INSERT INTO contact_consent_events (
+                                contact_id,
+                                status,
+                                source
+                            )
+
+                            VALUES (
+                                %s,
+                                'opted_out',
+                                'crm_opt_out'
+                            )
+                        """, (changed["id"],))
+
+    return {
+        "added": added,
+        "existing": existing,
+        "invalid": invalid,
+    }

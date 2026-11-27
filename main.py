@@ -34,6 +34,10 @@ from db import (
     process_next_bot_outbound,
     mark_stale_bot_outbounds_unknown,
 )
+from contacts.api import (
+    router as contacts_router,
+    initialize_contacts,
+)
 
 
 
@@ -121,6 +125,10 @@ async def lifespan(app: FastAPI):
         initialize_database
     )
 
+    await asyncio.to_thread(
+        initialize_contacts
+    )
+
     worker = asyncio.create_task(
         worker_loop()
     )
@@ -173,6 +181,7 @@ app.include_router(inbox_router)
 app.include_router(safe_reply_router)
 app.include_router(delivery_status_router)
 app.include_router(marketing_router)
+app.include_router(contacts_router)
 
 @app.get("/")
 def home():
