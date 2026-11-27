@@ -1,4 +1,3 @@
-
 import os
 import hmac
 import json
@@ -11,12 +10,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from auth import router as auth_router
 from inbox_api import router as inbox_router
-from fastapi import (
-    FastAPI,
-    Query,
-    HTTPException,
-    Request
-)
+from fastapi import FastAPI, Query, HTTPException, Request
 
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,33 +36,27 @@ from contacts.csv_import import router as contacts_csv_router
 
 from contacts.consent import router as contacts_consent_router
 
-
-
+from campaigns.api import (
+    router as campaigns_router,
+    initialize_campaigns,
+)
 
 load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ],
-    force=True
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
 
 logger = logging.getLogger("hytoma")
 
-VERIFY_TOKEN = os.getenv(
-    "WHATSAPP_VERIFY_TOKEN", ""
-)
+VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 
-META_APP_SECRET = os.getenv(
-    "META_APP_SECRET", ""
-)
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 
-EXPECTED_SENDER_ID = os.getenv(
-    "WHATSAPP_PHONE_NUMBER_ID", ""
-)
+EXPECTED_SENDER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 
 
 # Background event processor
@@ -85,9 +73,7 @@ async def worker_loop():
             now = loop.time()
 
             if now >= next_recovery_check:
-                recovered = await asyncio.to_thread(
-                    mark_stale_bot_outbounds_unknown
-                )
+                recovered = await asyncio.to_thread(mark_stale_bot_outbounds_unknown)
 
                 if recovered:
                     logger.warning(
@@ -97,13 +83,9 @@ async def worker_loop():
 
                 next_recovery_check = loop.time() + 300
 
-            inbound_processed = await asyncio.to_thread(
-                process_next_event
-            )
+            inbound_processed = await asyncio.to_thread(process_next_event)
 
-            outbound_processed = await asyncio.to_thread(
-                process_next_bot_outbound
-            )
+            outbound_processed = await asyncio.to_thread(process_next_bot_outbound)
 
             if not inbound_processed and not outbound_processed:
                 await asyncio.sleep(2)
@@ -116,23 +98,17 @@ async def worker_loop():
             await asyncio.sleep(5)
 
 
-
-
 # Application startup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
-    await asyncio.to_thread(
-        initialize_database
-    )
+    await asyncio.to_thread(initialize_database)
 
-    await asyncio.to_thread(
-        initialize_contacts
-    )
+    await asyncio.to_thread(initialize_contacts)
 
-    worker = asyncio.create_task(
-        worker_loop()
-    )
+    await asyncio.to_thread(initialize_campaigns)
+
+    worker = asyncio.create_task(worker_loop())
 
     try:
         yield
@@ -148,11 +124,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="HYTOMA WhatsApp Automation API",
-    version="1.1.0",
-    lifespan=lifespan
+    title="HYTOMA WhatsApp Automation API", version="1.1.0", lifespan=lifespan
 )
-
 
 
 allowed_origins = [
@@ -185,81 +158,54 @@ app.include_router(marketing_router)
 app.include_router(contacts_router)
 app.include_router(contacts_csv_router)
 app.include_router(contacts_consent_router)
+app.include_router(campaigns_router)
+
 
 @app.get("/")
 def home():
     return {
-        "message": (
-            "Welcome to HYTOMA WhatsApp Automation API"
-        ),
-        "status": "running"
+        "message": ("Welcome to HYTOMA WhatsApp Automation API"),
+        "status": "running",
     }
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "service": "HYTOMA WhatsApp Backend"
-    }
+    return {"status": "ok", "service": "HYTOMA WhatsApp Backend"}
 
 
 # Meta webhook verification
 @app.get("/webhook/whatsapp")
 def verify_webhook(
-    mode: str | None = Query(
-        None,
-        alias="hub.mode"
-    ),
-    token: str | None = Query(
-        None,
-        alias="hub.verify_token"
-    ),
-    challenge: str | None = Query(
-        None,
-        alias="hub.challenge"
-    ),
+    mode: str | None = Query(None, alias="hub.mode"),
+    token: str | None = Query(None, alias="hub.verify_token"),
+    challenge: str | None = Query(None, alias="hub.challenge"),
 ):
 
     if (
         mode == "subscribe"
         and VERIFY_TOKEN
         and token
-        and secrets.compare_digest(
-            token,
-            VERIFY_TOKEN
-        )
+        and secrets.compare_digest(token, VERIFY_TOKEN)
         and challenge is not None
     ):
-        return PlainTextResponse(
-            content=challenge
-        )
+        return PlainTextResponse(content=challenge)
 
-    raise HTTPException(
-        status_code=403,
-        detail="Verification failed"
-    )
+    raise HTTPException(status_code=403, detail="Verification failed")
 
 
 # Validate incoming Meta signature
-def verify_signature(
-    body: bytes,
-    signature: str | None
-) -> bool:
+def verify_signature(body: bytes, signature: str | None) -> bool:
 
     if not META_APP_SECRET or not signature:
         return False
 
-    expected = "sha256=" + hmac.new(
-        META_APP_SECRET.encode("utf-8"),
-        body,
-        hashlib.sha256
-    ).hexdigest()
-
-    return hmac.compare_digest(
-        expected,
-        signature
+    expected = (
+        "sha256="
+        + hmac.new(META_APP_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
     )
+
+    return hmac.compare_digest(expected, signature)
 
 
 # Extract supported customer reply
@@ -273,21 +219,12 @@ def extract_text(msg: dict) -> str | None:
     if message_type == "interactive":
         interactive = msg.get("interactive", {})
 
-        return (
-            interactive.get(
-                "button_reply", {}
-            ).get("id")
-
-            or interactive.get(
-                "list_reply", {}
-            ).get("id")
-        )
+        return interactive.get("button_reply", {}).get("id") or interactive.get(
+            "list_reply", {}
+        ).get("id")
 
     if message_type == "button":
-        return (
-            msg.get("button", {}).get("payload")
-            or msg.get("button", {}).get("text")
-        )
+        return msg.get("button", {}).get("payload") or msg.get("button", {}).get("text")
 
     return None
 
@@ -324,37 +261,25 @@ def extract_display_text(msg: dict) -> str | None:
     return None
 
 
-
 # Receive WhatsApp messages
 @app.post("/webhook/whatsapp")
 async def receive_webhook(request: Request):
 
     body = await request.body()
 
-    signature = request.headers.get(
-        "X-Hub-Signature-256"
-    )
+    signature = request.headers.get("X-Hub-Signature-256")
 
     if not verify_signature(body, signature):
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid webhook signature"
-        )
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
     try:
         payload = json.loads(body)
 
     except (ValueError, UnicodeDecodeError):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid JSON payload"
-        )
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="Expected JSON object"
-        )
+        raise HTTPException(status_code=400, detail="Expected JSON object")
     await asyncio.to_thread(
         record_delivery_statuses,
         payload,
@@ -369,20 +294,11 @@ async def receive_webhook(request: Request):
 
             value = change.get("value") or {}
 
-            sender_id = (
-                value.get("metadata") or {}
-            ).get("phone_number_id")
+            sender_id = (value.get("metadata") or {}).get("phone_number_id")
 
-            
-            if (
-                not EXPECTED_SENDER_ID
-                or sender_id != EXPECTED_SENDER_ID
-            ):
-                logger.warning(
-                "Ignoring webhook event with unexpected sender ID"
-                )
+            if not EXPECTED_SENDER_ID or sender_id != EXPECTED_SENDER_ID:
+                logger.warning("Ignoring webhook event with unexpected sender ID")
                 continue
-
 
             for msg in value.get("messages") or []:
 
@@ -392,22 +308,13 @@ async def receive_webhook(request: Request):
                 content = extract_text(msg)
                 display_content = extract_display_text(msg) or content
 
-                if (
-                    not message_id
-                    or not phone
-                    or not content
-                ):
+                if not message_id or not phone or not content:
                     continue
 
                 ref = msg.get("referral") or {}
 
-                ad_id = (
-                    ref.get("source_id")
-                    if ref.get("source_type") == "ad"
-                    else None
-                )
+                ad_id = ref.get("source_id") if ref.get("source_type") == "ad" else None
 
-                
                 await asyncio.to_thread(
                     enqueue_event,
                     message_id,
@@ -418,7 +325,4 @@ async def receive_webhook(request: Request):
                     display_content,
                 )
 
-
-    return {
-        "status": "received"
-    }
+    return {"status": "received"}
