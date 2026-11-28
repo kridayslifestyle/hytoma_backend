@@ -1,17 +1,28 @@
 import csv
 import io
 
-from fastapi import HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query
+)
 
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StrictBool
 
 from db import db_connect
+from auth import require_admin
 
 from contacts.api import (
-    router,
     filter_contacts,
     BulkTagRequest
+)
+
+router = APIRouter(
+    prefix="/admin/contacts",
+    tags=["Contacts Manager Actions"],
+    dependencies=[Depends(require_admin)]
 )
 
 

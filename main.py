@@ -6,12 +6,13 @@ import logging
 import secrets
 import asyncio
 import sys
+
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from auth import router as auth_router
 from inbox_api import router as inbox_router
 from fastapi import FastAPI, Query, HTTPException, Request
-
+from contacts.manage import router as contacts_manage_router
 from fastapi.responses import PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sales_management_api import router as sales_management_router
@@ -221,6 +222,7 @@ app.include_router(campaign_test_send_router)
 app.include_router(campaign_queue_router)
 app.include_router(campaign_reports_router)
 app.include_router(marketing_inbox_router)
+app.include_router(contacts_manage_router)
 
 
 @app.get("/")
