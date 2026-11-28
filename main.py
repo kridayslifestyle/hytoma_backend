@@ -73,6 +73,7 @@ from marketing_inbox.api import (
 import marketing_inbox.media
 
 from marketing_inbox.actions import initialize_marketing_actions
+from overview_api import router as overview_router
 
 load_dotenv()
 
@@ -223,6 +224,7 @@ app.include_router(campaign_queue_router)
 app.include_router(campaign_reports_router)
 app.include_router(marketing_inbox_router)
 app.include_router(contacts_manage_router)
+app.include_router(overview_router)
 
 
 @app.get("/")
