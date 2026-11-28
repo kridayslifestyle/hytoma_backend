@@ -150,11 +150,16 @@ def eligible_contact(contact, mode):
 
     return (
         contact["consent_status"] == "opted_in"
+
+        and contact.get("archived_at") is None
+
         and not contact["blocked"]
+
         and not (
             phone.startswith("120255501")
             and len(phone) == 11
         )
+
         and (
             mode == "production"
             or phone in allowed_numbers()
@@ -359,6 +364,7 @@ def prepare_campaign(
             SELECT
                 c.phone,
                 c.consent_status,
+                c.archived_at,
 
                 EXISTS (
                     SELECT 1
@@ -945,6 +951,7 @@ def process_campaign_once():
                     SELECT
                         c.phone,
                         c.consent_status,
+                        c.archived_at,
 
                         EXISTS (
                             SELECT 1

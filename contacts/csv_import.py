@@ -139,18 +139,23 @@ def parse_csv(content):
 
 def classify(cur, rows):
 
-    phones = list({r["phone"] for r in rows if not r["error"]})
+    phones = list({
+        r["phone"]
+        for r in rows
+        if not r["error"]
+    })
 
-    cur.execute(
-        """
-        SELECT phone
+    cur.execute("""
+        SELECT phone, archived_at
         FROM contacts
         WHERE phone = ANY(%s)
-    """,
-        (phones,),
-    )
 
-    existing = {r["phone"] for r in cur.fetchall()}
+    """, (phones,))
+
+    existing = {
+        r["phone"]: r["archived_at"]
+        for r in cur.fetchall()
+    }
 
     seen = set()
 
@@ -158,7 +163,7 @@ def classify(cur, rows):
         "total": len(rows),
         "valid": 0,
         "duplicate": 0,
-        "invalid": 0,
+        "invalid": 0
     }
 
     for r in rows:
@@ -167,11 +172,31 @@ def classify(cur, rows):
 
             status = "invalid"
 
-        elif r["phone"] in existing or r["phone"] in seen:
+        elif r["phone"] in existing:
 
             status = "duplicate"
 
-            r["error"] = "Phone already exists " "or repeats in file."
+            if existing[r["phone"]]:
+
+                r["error"] = (
+                    "Archived contact; restore explicitly "
+                    "instead of importing."
+                )
+
+            else:
+
+                r["error"] = (
+                    "Phone already exists in Contacts Manager."
+                )
+
+        elif r["phone"] in seen:
+
+            status = "duplicate"
+
+            r["error"] = (
+                "Duplicate phone in this CSV "
+                "after normalization."
+            )
 
         else:
 

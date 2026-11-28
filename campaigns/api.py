@@ -199,6 +199,7 @@ def audience_rows(cur, filters):
         FROM contacts c
 
         WHERE c.consent_status = 'opted_in'
+        AND c.archived_at IS NULL
 
         AND c.phone !~ '^120255501[0-9]{2}$'
 

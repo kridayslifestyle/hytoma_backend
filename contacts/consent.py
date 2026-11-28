@@ -50,6 +50,8 @@ def grant_consent(cur, contact_ids, source):
 
         AND consent_status = 'pending'
 
+        AND archived_at IS NULL
+
         AND phone !~ '^120255501[0-9]{2}$'
 
         AND NOT EXISTS (

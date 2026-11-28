@@ -26,7 +26,6 @@ from campaigns.send_test import build_components
 from whatsapp_service import send_whatsapp_payload
 from marketing_inbox.api import router
 
-
 log = logging.getLogger(__name__)
 
 MAX_BYTES = 4 * 1024 * 1024
@@ -43,7 +42,8 @@ def initialize_marketing_actions():
 
     with db_connect() as conn, conn.cursor() as cur:
 
-        cur.execute("""
+        cur.execute(
+            """
             ALTER TABLE inbound_events
             ADD COLUMN IF NOT EXISTS message_at TIMESTAMPTZ;
 
@@ -73,16 +73,20 @@ def initialize_marketing_actions():
             ON marketing_manual_messages(
                 contact_id, created_at DESC
             );
-        """, prepare=False)
+        """,
+            prepare=False,
+        )
 
 
 def target(cur, contact_id):
 
-    cur.execute("""
+    cur.execute(
+        """
         SELECT
             c.id,
             c.phone,
             c.consent_status,
+            c.archived_at,
             r.campaign_id,
             l.status AS lead_status,
             l.assigned_salesperson,
@@ -114,14 +118,14 @@ def target(cur, contact_id):
 
         LEFT JOIN leads l ON l.phone = c.phone
         WHERE c.id = %s
-    """, (contact_id,))
+    """,
+        (contact_id,),
+    )
 
     row = cur.fetchone()
 
     if not row:
-        raise HTTPException(
-            404, "Conversation not found."
-        )
+        raise HTTPException(404, "Conversation not found.")
 
     return row
 
@@ -130,39 +134,38 @@ def check_send(cur, contact_id, kind):
 
     row = target(cur, contact_id)
 
+    if row["archived_at"]:
+        raise HTTPException(
+        403,
+        "This contact is archived. Restore it before sending."
+    )
+
     if (
         row["consent_status"] == "opted_out"
         or row["lead_status"] == "opted_out"
-        or re.fullmatch(
-            r"120255501[0-9]{2}", row["phone"]
-        )
+        or re.fullmatch(r"120255501[0-9]{2}", row["phone"])
     ):
-        raise HTTPException(
-            403, "Contact cannot receive messages."
-        )
+        raise HTTPException(403, "Contact cannot receive messages.")
 
     if kind == "template":
 
         if row["consent_status"] != "opted_in":
-            raise HTTPException(
-                403,
-                "Verified messaging permission is required."
-            )
+            raise HTTPException(403, "Verified messaging permission is required.")
 
     else:
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT %s::timestamptz >
                 NOW() + INTERVAL '60 seconds'
                 AS open
-        """, (row["window_expires_at"],))
+        """,
+            (row["window_expires_at"],),
+        )
 
         if cur.fetchone()["open"] is not True:
 
-            raise HTTPException(
-                403,
-                "Reply window closed. Use an approved template."
-            )
+            raise HTTPException(403, "Reply window closed. Use an approved template.")
 
     return row
 
@@ -173,9 +176,7 @@ def templates():
         live = get_marketing_templates()
 
     except (requests.RequestException, RuntimeError):
-        raise HTTPException(
-            502, "Unable to load approved templates."
-        )
+        raise HTTPException(502, "Unable to load approved templates.")
 
     result = []
 
@@ -184,9 +185,7 @@ def templates():
         if template.get("status") != "APPROVED":
             continue
 
-        if template.get("category") not in (
-            "MARKETING", "UTILITY"
-        ):
+        if template.get("category") not in ("MARKETING", "UTILITY"):
             continue
 
         try:
@@ -194,10 +193,7 @@ def templates():
         except HTTPException:
             continue
 
-        result.append({
-            **template,
-            **req
-        })
+        result.append({**template, **req})
 
     return result
 
@@ -205,9 +201,7 @@ def templates():
 @router.get("/reply-templates")
 def reply_templates():
 
-    return {
-        "templates": templates()
-    }
+    return {"templates": templates()}
 
 
 def read_file(file):
@@ -219,28 +213,19 @@ def read_file(file):
 
         mime = file.content_type or ""
 
-        name = PurePath(
-            (file.filename or "").replace("\\", "/")
-        ).name
+        name = PurePath((file.filename or "").replace("\\", "/")).name
 
         if mime not in KINDS or not name:
-            raise HTTPException(
-                422, "Choose JPG, PNG, MP4 or PDF."
-            )
+            raise HTTPException(422, "Choose JPG, PNG, MP4 or PDF.")
 
         data = file.file.read(MAX_BYTES + 1)
 
         if not data or len(data) > MAX_BYTES:
-            raise HTTPException(
-                413, "Attachment must be 4 MB or smaller."
-            )
+            raise HTTPException(413, "Attachment must be 4 MB or smaller.")
 
         if mime == "application/pdf":
 
-            if (
-                not name.lower().endswith(".pdf")
-                or not data.startswith(b"%PDF-")
-            ):
+            if not name.lower().endswith(".pdf") or not data.startswith(b"%PDF-"):
                 raise HTTPException(422, "Invalid PDF.")
 
         else:
@@ -264,33 +249,18 @@ def upload(name, mime, data):
 
     phone = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 
-    version = os.getenv(
-        "WHATSAPP_API_VERSION", "v27.0"
-    )
+    version = os.getenv("WHATSAPP_API_VERSION", "v27.0")
 
     if not token or not phone:
-        raise HTTPException(
-            503, "WhatsApp credentials missing."
-        )
+        raise HTTPException(503, "WhatsApp credentials missing.")
 
     try:
 
         res = requests.post(
             f"https://graph.facebook.com/{version}/{phone}/media",
-
-            headers={
-                "Authorization": f"Bearer {token}"
-            },
-
-            data={
-                "messaging_product": "whatsapp",
-                "type": mime
-            },
-
-            files={
-                "file": (name, data, mime)
-            },
-
+            headers={"Authorization": f"Bearer {token}"},
+            data={"messaging_product": "whatsapp", "type": mime},
+            files={"file": (name, data, mime)},
             timeout=60,
         )
 
@@ -303,15 +273,9 @@ def upload(name, mime, data):
 
         return media_id
 
-    except (
-        requests.RequestException,
-        ValueError,
-        KeyError
-    ):
+    except (requests.RequestException, ValueError, KeyError):
 
-        raise HTTPException(
-            502, "Media upload failed; no message sent."
-        )
+        raise HTTPException(502, "Media upload failed; no message sent.")
 
 
 @router.post("/conversations/{contact_id}/send")
@@ -327,9 +291,10 @@ def send(
 
     body = body.strip()
 
-    if kind not in (
-        "text", "image", "video", "document", "template"
-    ) or len(body) > 4096:
+    if (
+        kind not in ("text", "image", "video", "document", "template")
+        or len(body) > 4096
+    ):
 
         raise HTTPException(422, "Invalid message.")
 
@@ -340,23 +305,17 @@ def send(
         vals = json.loads(values)
 
         if not isinstance(vals, dict) or any(
-            not isinstance(v, str)
-            or not v.strip()
-            or len(v) > 1024
+            not isinstance(v, str) or not v.strip() or len(v) > 1024
             for v in vals.values()
         ):
             raise ValueError()
 
     except (ValueError, TypeError):
 
-        raise HTTPException(
-            422, "Invalid template variables."
-        )
+        raise HTTPException(422, "Invalid template variables.")
 
     if kind == "text" and (not body or data):
-        raise HTTPException(
-            422, "Enter text without an attachment."
-        )
+        raise HTTPException(422, "Enter text without an attachment.")
 
     if kind in ("image", "video", "document"):
 
@@ -364,15 +323,12 @@ def send(
 
             raise HTTPException(
                 422,
-                "Choose a matching attachment and "
-                "caption up to 1024 characters."
+                "Choose a matching attachment and " "caption up to 1024 characters.",
             )
 
     fingerprint = hashlib.sha256(
-        json.dumps(
-            [kind, body, template_id, vals, name, mime],
-            sort_keys=True
-        ).encode() + (data or b"")
+        json.dumps([kind, body, template_id, vals, name, mime], sort_keys=True).encode()
+        + (data or b"")
     ).hexdigest()
 
     with db_connect() as conn, conn.cursor() as cur:
@@ -383,12 +339,15 @@ def send(
 
         with db_connect() as conn, conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT contact_id, fingerprint, status, wamid
 
                 FROM marketing_manual_messages
                 WHERE request_id = %s
-            """, (request_id,))
+            """,
+                (request_id,),
+            )
 
             prev = cur.fetchone()
 
@@ -398,18 +357,14 @@ def send(
                     prev["contact_id"] != contact_id
                     or prev["fingerprint"] != fingerprint
                 ):
-                    raise HTTPException(
-                        409, "Request ID already used."
-                    )
+                    raise HTTPException(409, "Request ID already used.")
 
-                return {
-                    "status": prev["status"],
-                    "whatsapp_message_id": prev["wamid"]
-                }
+                return {"status": prev["status"], "whatsapp_message_id": prev["wamid"]}
 
             row = check_send(cur, contact_id, kind)
 
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT 1
                 FROM marketing_manual_messages
                 WHERE contact_id = %s
@@ -421,95 +376,69 @@ def send(
                             marketing_manual_messages.wamid
                   )
                 LIMIT 1
-            """, (contact_id,))
+            """,
+                (contact_id,),
+            )
 
             if cur.fetchone():
 
                 raise HTTPException(
                     409,
                     "Previous send is uncertain. "
-                    "Verify delivery before further sends."
+                    "Verify delivery before further sends.",
                 )
 
         snapshot = None
 
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": row["phone"],
-            "type": kind
-        }
+        payload = {"messaging_product": "whatsapp", "to": row["phone"], "type": kind}
 
         # TEXT MESSAGE
 
         if kind == "text":
 
-            payload["text"] = {
-                "body": body,
-                "preview_url": False
-            }
+            payload["text"] = {"body": body, "preview_url": False}
 
         # APPROVED TEMPLATE
 
         elif kind == "template":
 
             snapshot = next(
-                (
-                    t for t in templates()
-                    if str(t["id"]) == template_id
-                ),
-                None
+                (t for t in templates() if str(t["id"]) == template_id), None
             )
 
             if not snapshot:
-                raise HTTPException(
-                    422,
-                    "Template is not currently approved."
-                )
+                raise HTTPException(422, "Template is not currently approved.")
 
             req = requirements(snapshot)
 
             if set(vals) != set(req["fields"]):
 
-                raise HTTPException(
-                    422, "Fill every template variable."
-                )
+                raise HTTPException(422, "Fill every template variable.")
 
             required = req["media_required"]
 
-            if (
-                required
-                and KINDS.get(mime, "").upper() != required
-            ) or (not required and data):
+            if (required and KINDS.get(mime, "").upper() != required) or (
+                not required and data
+            ):
 
-                raise HTTPException(
-                    422,
-                    "Select the required template header media."
-                )
+                raise HTTPException(422, "Select the required template header media.")
 
-            media_id = (
-                upload(name, mime, data)
-                if data else None
+            media_id = upload(name, mime, data) if data else None
+
+            components = build_components(
+                {
+                    "id": row["campaign_id"],
+                    "template_snapshot": snapshot,
+                    "template_values": vals,
+                    "media_id": media_id,
+                    "media_type": required,
+                }
             )
 
-            components = build_components({
-
-                "id": row["campaign_id"],
-                "template_snapshot": snapshot,
-                "template_values": vals,
-                "media_id": media_id,
-                "media_type": required
-
-            })
-
             payload["template"] = {
-
                 "name": snapshot["name"],
-
-                "language": {
-                    "code": snapshot["language"]
-                },
-
-                "components": components
+                "language": {"code": snapshot["language"]},
+                "components": components,
             }
 
         # IMAGE, VIDEO OR DOCUMENT
@@ -518,9 +447,7 @@ def send(
 
             media_id = upload(name, mime, data)
 
-            payload[kind] = {
-                "id": media_id
-            }
+            payload[kind] = {"id": media_id}
 
             if body:
                 payload[kind]["caption"] = body
@@ -534,7 +461,8 @@ def send(
 
             row = check_send(cur, contact_id, kind)
 
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO marketing_manual_messages (
                     request_id,
                     contact_id,
@@ -557,25 +485,25 @@ def send(
                 ON CONFLICT (request_id) DO NOTHING
                 RETURNING request_id
 
-            """, (
-                request_id,
-                contact_id,
-                row["campaign_id"],
-                kind,
-                body,
-                Jsonb(snapshot) if snapshot else None,
-                Jsonb(vals),
-                name,
-                mime,
-                data,
-                fingerprint
-            ))
+            """,
+                (
+                    request_id,
+                    contact_id,
+                    row["campaign_id"],
+                    kind,
+                    body,
+                    Jsonb(snapshot) if snapshot else None,
+                    Jsonb(vals),
+                    name,
+                    mime,
+                    data,
+                    fingerprint,
+                ),
+            )
 
             if not cur.fetchone():
 
-                raise HTTPException(
-                    409, "Request already submitted."
-                )
+                raise HTTPException(409, "Request already submitted.")
 
         wamid = None
 
@@ -590,7 +518,8 @@ def send(
 
             with db_connect() as conn, conn.cursor() as cur:
 
-                cur.execute("""
+                cur.execute(
+                    """
                     UPDATE marketing_manual_messages
 
                     SET status = 'accepted',
@@ -598,7 +527,9 @@ def send(
 
                     WHERE request_id = %s
 
-                """, (wamid, request_id))
+                """,
+                    (wamid, request_id),
+                )
 
         except Exception as exc:
 
@@ -609,13 +540,13 @@ def send(
             )
 
             log.warning(
-                "Manual marketing send %s",
-                "rejected" if rejected else "uncertain"
+                "Manual marketing send %s", "rejected" if rejected else "uncertain"
             )
 
             with db_connect() as conn, conn.cursor() as cur:
 
-                cur.execute("""
+                cur.execute(
+                    """
                     UPDATE marketing_manual_messages
 
                     SET status = %s,
@@ -624,30 +555,23 @@ def send(
                     WHERE request_id = %s
                       AND status = 'sending'
 
-                """, (
-                    "failed" if rejected else "unknown",
-                    wamid,
-                    request_id
-                ))
+                """,
+                    ("failed" if rejected else "unknown", wamid, request_id),
+                )
 
             if rejected:
 
                 raise HTTPException(
                     422,
                     "Meta rejected the message. "
-                    "Check template or recipient eligibility."
+                    "Check template or recipient eligibility.",
                 ) from exc
 
             raise HTTPException(
-                502,
-                "Send outcome uncertain. "
-                "Do not resend; check WhatsApp."
+                502, "Send outcome uncertain. " "Do not resend; check WhatsApp."
             ) from exc
 
-        return {
-            "status": "accepted",
-            "whatsapp_message_id": wamid
-        }
+        return {"status": "accepted", "whatsapp_message_id": wamid}
 
 
 @router.get("/manual-media/{request_id}")
@@ -655,55 +579,41 @@ def manual_media(request_id: UUID):
 
     with db_connect() as conn, conn.cursor() as cur:
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT mime, media_data
             FROM marketing_manual_messages
             WHERE request_id = %s
 
-        """, (request_id,))
+        """,
+            (request_id,),
+        )
 
         row = cur.fetchone()
 
-    if (
-        not row
-        or not row["media_data"]
-        or row["mime"] not in KINDS
-    ):
+    if not row or not row["media_data"] or row["mime"] not in KINDS:
 
-        raise HTTPException(
-            404, "Attachment unavailable."
-        )
+        raise HTTPException(404, "Attachment unavailable.")
 
     headers = {
         "Cache-Control": "private, no-store",
-        "X-Content-Type-Options": "nosniff"
+        "X-Content-Type-Options": "nosniff",
     }
 
     if row["mime"] == "application/pdf":
 
-        headers["Content-Disposition"] = (
-            'attachment; filename="document.pdf"'
-        )
+        headers["Content-Disposition"] = 'attachment; filename="document.pdf"'
 
-    return Response(
-        bytes(row["media_data"]),
-        media_type=row["mime"],
-        headers=headers
-    )
+    return Response(bytes(row["media_data"]), media_type=row["mime"], headers=headers)
 
 
 class LeadRequest(BaseModel):
 
-    salesperson_id: int | None = Field(
-        default=None, gt=0
-    )
+    salesperson_id: int | None = Field(default=None, gt=0)
 
 
 @router.post("/conversations/{contact_id}/lead")
-def create_lead(
-    contact_id: int,
-    payload: LeadRequest
-):
+def create_lead(contact_id: int, payload: LeadRequest):
 
     with db_connect() as conn, conn.cursor() as cur:
 
@@ -719,32 +629,32 @@ def create_lead(
                 row["consent_status"] == "opted_out"
                 or row["lead_status"] == "opted_out"
             ):
-                raise HTTPException(
-                    403, "Contact opted out."
-                )
+                raise HTTPException(403, "Contact opted out.")
 
             salesperson = None
 
             if payload.salesperson_id:
 
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT name
                     FROM salespeople
                     WHERE id = %s
                       AND is_active
-                """, (payload.salesperson_id,))
+                """,
+                    (payload.salesperson_id,),
+                )
 
                 person = cur.fetchone()
 
                 if not person:
 
-                    raise HTTPException(
-                        422, "Choose an active salesperson."
-                    )
+                    raise HTTPException(422, "Choose an active salesperson.")
 
                 salesperson = person["name"]
 
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO leads (
                     phone,
                     step,
@@ -765,11 +675,14 @@ def create_lead(
 
                 ON CONFLICT (phone) DO NOTHING
 
-            """, (row["phone"],))
+            """,
+                (row["phone"],),
+            )
 
             if salesperson:
 
-                cur.execute("""
+                cur.execute(
+                    """
                     UPDATE leads
 
                     SET assigned_salesperson = %s,
@@ -780,9 +693,12 @@ def create_lead(
                     WHERE phone = %s
                       AND status <> 'opted_out'
 
-                """, (salesperson, row["phone"]))
+                """,
+                    (salesperson, row["phone"]),
+                )
 
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT
                     phone,
                     status,
@@ -792,8 +708,8 @@ def create_lead(
                 FROM leads
                 WHERE phone = %s
 
-            """, (row["phone"],))
+            """,
+                (row["phone"],),
+            )
 
-            return {
-                "lead": cur.fetchone()
-            }
+            return {"lead": cur.fetchone()}

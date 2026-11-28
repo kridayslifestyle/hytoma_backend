@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field
 from auth import require_admin
 from db import db_connect
 
-
 router = APIRouter(
     prefix="/admin/contacts",
     tags=["Contacts Manager"],
@@ -55,6 +54,13 @@ CREATE TABLE IF NOT EXISTS contacts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+    ALTER TABLE contacts
+        ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+
+    CREATE INDEX IF NOT EXISTS contacts_active_idx
+    ON contacts(id)
+    WHERE archived_at IS NULL;
 );
 
 ALTER TABLE contacts
@@ -101,38 +107,33 @@ def initialize_contacts():
 
         with conn.cursor() as cur:
 
-            cur.execute(
-                CONTACTS_SCHEMA,
-                prepare=False
-            )
+            cur.execute(CONTACTS_SCHEMA, prepare=False)
 
 
 # ============================================================
 # 2. PHONE NUMBER NORMALIZATION
 # ============================================================
 
+
 def normalize_phone(value: str) -> str:
 
-    phone = re.sub(
-        r"[\s()\-]",
-        "",
-        value.strip()
-    )
+    phone = re.sub(r"[\s()\-]", "", value.strip())
 
     if phone.startswith("+"):
-
         phone = phone[1:]
 
-    elif re.fullmatch(r"[6-9][0-9]{9}", phone):
+    elif phone.startswith("00"):
+        phone = phone[2:]
 
-        # Default country code for Indian mobile numbers
+    elif re.fullmatch(r"0[6-9][0-9]{9}", phone):
+        phone = "91" + phone[1:]
+
+    elif re.fullmatch(r"[6-9][0-9]{9}", phone):
         phone = "91" + phone
 
     if not re.fullmatch(r"[1-9][0-9]{7,14}", phone):
 
-        raise ValueError(
-            "Enter a valid phone number with country code."
-        )
+        raise ValueError("Enter a valid phone number with country code.")
 
     return phone
 
@@ -169,137 +170,181 @@ class ContactUpdate(BaseModel):
 # 4. NORMALIZE TAGS
 # ============================================================
 
+
 def clean_tags(tags):
 
-    cleaned = list(
-        dict.fromkeys(
-            t.strip()
-            for t in tags
-            if t.strip()
-        )
-    )
+    cleaned = list(dict.fromkeys(t.strip() for t in tags if t.strip()))
 
     if any(len(t) > 80 for t in cleaned):
 
         raise HTTPException(
-            status_code=422,
-            detail="Tags must not exceed 80 characters."
+            status_code=422, detail="Tags must not exceed 80 characters."
         )
 
     return cleaned
+
+
+def filter_contacts(
+    search="",
+    consent_status="all",
+    contact_type="all",
+    tag="",
+    tag_mode="all",
+    archived=False,
+):
+
+    if consent_status not in ("all", "pending", "opted_in", "opted_out"):
+        raise HTTPException(422, "Invalid permission filter.")
+
+    if contact_type not in (
+        "all",
+        "unclassified",
+        "customer",
+        "interior_designer",
+        "builder",
+        "architect",
+        "other",
+    ):
+        raise HTTPException(422, "Invalid contact type.")
+
+    if tag_mode not in ("all", "any"):
+        raise HTTPException(422, "Invalid tag match mode.")
+
+    tags = list(dict.fromkeys(t.strip().lower() for t in tag.split(",") if t.strip()))
+
+    if len(tags) > 20 or any(len(t) > 80 for t in tags):
+        raise HTTPException(422, "Invalid tags.")
+
+    term = "%" + search.strip() + "%"
+
+    where = """
+        WHERE (
+            name ILIKE %s
+            OR phone ILIKE %s
+            OR location ILIKE %s
+        )
+
+        AND (%s = 'all' OR consent_status = %s)
+
+        AND (%s = 'all' OR contact_type = %s)
+
+        AND (
+            (%s AND archived_at IS NOT NULL)
+            OR
+            (NOT %s AND archived_at IS NULL)
+        )
+    """
+
+    params = [
+        term,
+        term,
+        term,
+        consent_status,
+        consent_status,
+        contact_type,
+        contact_type,
+        archived,
+        archived,
+    ]
+
+    if tags:
+
+        operator = "@>" if tag_mode == "all" else "&&"
+
+        where += (
+            " AND ARRAY("
+            "SELECT lower(t) FROM unnest(tags) AS t"
+            ") " + operator + " %s::text[]"
+        )
+
+        params.append(tags)
+
+    return where, params
 
 
 # ============================================================
 # 5. GET CONTACTS AND STATISTICS
 # ============================================================
 
+
 @router.get("")
 def list_contacts(
-    search: str = Query(default="", max_length=150),
-    consent_status: str = Query(
-        default="all",
-        pattern="^(all|pending|opted_in|opted_out)$",
-    ),
-    contact_type: str = Query(
-        default="all",
-        pattern="^(all|unclassified|customer|interior_designer|builder|architect|other)$",
-    ),
-    tag: str = Query(default="", max_length=80),
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
+    search: str = Query("", max_length=150),
+    consent_status: str = "all",
+    contact_type: str = "all",
+    tag: str = Query("", max_length=1620),
+    tag_mode: str = "all",
+    archived: bool = False,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
-    term = "%" + search.strip() + "%"
 
-    with db_connect() as conn:
-        with conn.cursor() as cur:
+    where, params = filter_contacts(
+        search,
+        consent_status,
+        contact_type,
+        tag,
+        tag_mode,
+        archived,
+    )
 
-            cur.execute("""
-                SELECT
+    with db_connect() as conn, conn.cursor() as cur:
 
-                    COUNT(*) AS total,
+        cur.execute("""
+            SELECT
 
-                    COUNT(*) FILTER (
-                        WHERE consent_status = 'pending'
-                    ) AS pending,
+                COUNT(*) AS total,
 
-                    COUNT(*) FILTER (
-                        WHERE consent_status = 'opted_in'
-                    ) AS opted_in,
+                COUNT(*) FILTER (
+                    WHERE consent_status = 'pending'
+                ) AS pending,
 
-                    COUNT(*) FILTER (
-                        WHERE consent_status = 'opted_out'
-                    ) AS opted_out,
+                COUNT(*) FILTER (
+                    WHERE consent_status = 'opted_in'
+                ) AS opted_in,
 
-                    COUNT(*) FILTER (
-                        WHERE contact_type = 'customer'
-                    ) AS customers,
+                COUNT(*) FILTER (
+                    WHERE consent_status = 'opted_out'
+                ) AS opted_out,
 
-                    COUNT(*) FILTER (
-                        WHERE contact_type = 'interior_designer'
-                    ) AS interior_designers,
+                COUNT(*) FILTER (
+                    WHERE contact_type = 'customer'
+                ) AS customers,
 
-                    COUNT(*) FILTER (
-                        WHERE contact_type = 'builder'
-                    ) AS builders
+                COUNT(*) FILTER (
+                    WHERE contact_type = 'interior_designer'
+                ) AS interior_designers,
 
-                FROM contacts
-            """)
+                COUNT(*) FILTER (
+                    WHERE contact_type = 'builder'
+                ) AS builders
 
-            stats = cur.fetchone()
+            FROM contacts
 
-            where = """
-                WHERE (
-                    name ILIKE %s
-                    OR phone ILIKE %s
-                    OR location ILIKE %s
-                )
-                AND (%s = 'all' OR consent_status = %s)
-                AND (%s = 'all' OR contact_type = %s)
-                AND (
-                    %s = ''
-                    OR EXISTS (
-                        SELECT 1
-                        FROM unnest(tags) AS t(value)
-                        WHERE lower(t.value) = lower(%s)
-                    )
-                )
-            """
+            WHERE archived_at IS NULL
+        """)
 
-            params = (
-                term,
-                term,
-                term,
-                consent_status,
-                consent_status,
-                contact_type,
-                contact_type,
-                tag.strip(),
-                tag.strip(),
-            )
+        stats = cur.fetchone()
 
-            cur.execute(
-                "SELECT COUNT(*) AS total FROM contacts " + where,
-                params,
-            )
+        cur.execute("SELECT COUNT(*) AS total FROM contacts" + where, params)
 
-            total = cur.fetchone()["total"]
+        total = cur.fetchone()["total"]
 
-            cur.execute(
-                "SELECT * FROM contacts " + where +
-                " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
-                (*params, limit, offset),
-            )
+        cur.execute(
+            "SELECT * FROM contacts" + where + """
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s OFFSET %s
+            """,
+            (*params, limit, offset),
+        )
 
-            return {
-                "contacts": cur.fetchall(),
-                "total": total,
-                "stats": stats,
-            }
+        return {"contacts": cur.fetchall(), "total": total, "stats": stats}
 
 
 # ============================================================
 # 6. CREATE CONTACT MANUALLY
 # ============================================================
+
 
 @router.post("", status_code=201)
 def create_contact(payload: ContactCreate):
@@ -314,7 +359,8 @@ def create_contact(payload: ContactCreate):
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO contacts (
                     phone,
                     name,
@@ -327,13 +373,15 @@ def create_contact(payload: ContactCreate):
                 ON CONFLICT (phone)
                 DO NOTHING
                 RETURNING *
-            """, (
-                phone,
-                payload.name.strip(),
-                payload.location.strip(),
-                tags,
-                payload.contact_type,
-            ))
+            """,
+                (
+                    phone,
+                    payload.name.strip(),
+                    payload.location.strip(),
+                    tags,
+                    payload.contact_type,
+                ),
+            )
 
             contact = cur.fetchone()
 
@@ -350,6 +398,7 @@ def create_contact(payload: ContactCreate):
 # 7. EDIT CONTACT DETAILS
 # ============================================================
 
+
 @router.patch("/{contact_id}")
 def update_contact(
     contact_id: int,
@@ -360,7 +409,8 @@ def update_contact(
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE contacts
                 SET
                     name = %s,
@@ -368,15 +418,18 @@ def update_contact(
                     tags = %s,
                     contact_type = COALESCE(%s, contact_type),
                     updated_at = NOW()
-                WHERE id = %s
+                WHERE id=%s
+                AND archived_at IS NULL
                 RETURNING *
-            """, (
-                payload.name.strip(),
-                payload.location.strip(),
-                tags,
-                payload.contact_type,
-                contact_id,
-            ))
+            """,
+                (
+                    payload.name.strip(),
+                    payload.location.strip(),
+                    tags,
+                    payload.contact_type,
+                    contact_id,
+                ),
+            )
 
             contact = cur.fetchone()
 
@@ -387,9 +440,12 @@ def update_contact(
                 )
 
             return {"contact": contact}
+
+
 # ============================================================
 # 8. IMPORT EXISTING CRM LEADS
 # ============================================================
+
 
 @router.post("/sync-crm")
 def sync_crm_contacts():
@@ -417,16 +473,15 @@ def sync_crm_contacts():
 
                 try:
 
-                    phone = normalize_phone(
-                        lead["phone"]
-                    )
+                    phone = normalize_phone(lead["phone"])
 
                 except (ValueError, AttributeError):
 
                     invalid += 1
                     continue
 
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO contacts (
                         phone,
                         location,
@@ -443,10 +498,12 @@ def sync_crm_contacts():
                     DO NOTHING
 
                     RETURNING id
-                """, (
-                    phone,
-                    (lead["project_location"] or "")[:255],
-                ))
+                """,
+                    (
+                        phone,
+                        (lead["project_location"] or "")[:255],
+                    ),
+                )
 
                 if cur.fetchone():
 
@@ -460,7 +517,8 @@ def sync_crm_contacts():
 
                 if lead["status"] == "opted_out":
 
-                    cur.execute("""
+                    cur.execute(
+                        """
                         UPDATE contacts
 
                         SET
@@ -474,13 +532,16 @@ def sync_crm_contacts():
                         AND consent_status <> 'opted_out'
 
                         RETURNING id
-                    """, (phone,))
+                    """,
+                        (phone,),
+                    )
 
                     changed = cur.fetchone()
 
                     if changed:
 
-                        cur.execute("""
+                        cur.execute(
+                            """
                             INSERT INTO contact_consent_events (
                                 contact_id,
                                 status,
@@ -492,13 +553,16 @@ def sync_crm_contacts():
                                 'opted_out',
                                 'crm_opt_out'
                             )
-                        """, (changed["id"],))
+                        """,
+                            (changed["id"],),
+                        )
 
     return {
         "added": added,
         "existing": existing,
         "invalid": invalid,
     }
+
 
 class BulkContactType(BaseModel):
     contact_ids: list[int] = Field(
@@ -522,19 +586,23 @@ def bulk_contact_type(payload: BulkContactType):
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE contacts
                 SET
                     contact_type = %s,
                     updated_at = NOW()
                 WHERE id = ANY(%s)
                 AND contact_type <> %s
+                AND archived_at IS NULL
                 RETURNING id
-            """, (
-                payload.contact_type,
-                ids,
-                payload.contact_type,
-            ))
+            """,
+                (
+                    payload.contact_type,
+                    ids,
+                    payload.contact_type,
+                ),
+            )
 
             updated = len(cur.fetchall())
 
@@ -542,6 +610,7 @@ def bulk_contact_type(payload: BulkContactType):
         "updated": updated,
         "skipped": len(ids) - updated,
     }
+
 
 class BulkTagRequest(BaseModel):
 
@@ -563,11 +632,7 @@ def bulk_tag(payload: BulkTagRequest):
 
     tag = payload.tag.strip()
 
-    if (
-        any(i <= 0 for i in ids)
-        or not tag
-        or "," in tag
-    ):
+    if any(i <= 0 for i in ids) or not tag or "," in tag:
         raise HTTPException(
             422,
             "Enter one valid tag and select contacts.",
@@ -575,18 +640,16 @@ def bulk_tag(payload: BulkTagRequest):
 
     with db_connect() as conn, conn.cursor() as cur:
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT id, tags
-
             FROM contacts
-
             WHERE id = ANY(%s)
-
-            ORDER BY id
-
-            FOR UPDATE
-
-        """, (ids,))
+            AND archived_at IS NULL
+            ORDER BY id FOR UPDATE
+        """,
+            (ids,),
+        )
 
         rows = cur.fetchall()
 
@@ -598,10 +661,7 @@ def bulk_tag(payload: BulkTagRequest):
 
             tags = row["tags"] or []
 
-            if any(
-                t.casefold() == tag.casefold()
-                for t in tags
-            ):
+            if any(t.casefold() == tag.casefold() for t in tags):
                 existing += 1
                 continue
 
@@ -609,7 +669,8 @@ def bulk_tag(payload: BulkTagRequest):
                 full += 1
                 continue
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE contacts
 
                 SET tags = array_append(tags, %s),
@@ -617,10 +678,12 @@ def bulk_tag(payload: BulkTagRequest):
 
                 WHERE id = %s
 
-            """, (
-                tag,
-                row["id"],
-            ))
+            """,
+                (
+                    tag,
+                    row["id"],
+                ),
+            )
 
             updated += 1
 

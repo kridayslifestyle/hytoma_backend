@@ -399,7 +399,8 @@ def conversation(
                 contact_type,
                 consent_status,
                 tags,
-                location
+                location,
+                archived_at
 
             FROM contacts
 

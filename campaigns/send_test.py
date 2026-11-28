@@ -835,13 +835,10 @@ def test_send(
 
                     SELECT EXISTS (
 
-                        SELECT 1
-
-                        FROM contacts
-
-                        WHERE phone = %s
-
-                        AND consent_status = 'opted_in'
+                        SELECT 1 FROM contacts
+                        WHERE phone=%s
+                        AND consent_status='opted_in'
+                        AND archived_at IS NULL
 
                     )
 
