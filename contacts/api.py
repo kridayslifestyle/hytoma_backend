@@ -215,16 +215,33 @@ def list_contacts(
 
             cur.execute("""
                 SELECT
+
                     COUNT(*) AS total,
+
                     COUNT(*) FILTER (
-                        WHERE consent_status='pending'
+                        WHERE consent_status = 'pending'
                     ) AS pending,
+
                     COUNT(*) FILTER (
-                        WHERE consent_status='opted_in'
+                        WHERE consent_status = 'opted_in'
                     ) AS opted_in,
+
                     COUNT(*) FILTER (
-                        WHERE consent_status='opted_out'
-                    ) AS opted_out
+                        WHERE consent_status = 'opted_out'
+                    ) AS opted_out,
+
+                    COUNT(*) FILTER (
+                        WHERE contact_type = 'customer'
+                    ) AS customers,
+
+                    COUNT(*) FILTER (
+                        WHERE contact_type = 'interior_designer'
+                    ) AS interior_designers,
+
+                    COUNT(*) FILTER (
+                        WHERE contact_type = 'builder'
+                    ) AS builders
+
                 FROM contacts
             """)
 
@@ -524,4 +541,92 @@ def bulk_contact_type(payload: BulkContactType):
     return {
         "updated": updated,
         "skipped": len(ids) - updated,
+    }
+
+class BulkTagRequest(BaseModel):
+
+    contact_ids: list[int] = Field(
+        min_length=1,
+        max_length=5000,
+    )
+
+    tag: str = Field(
+        min_length=1,
+        max_length=80,
+    )
+
+
+@router.post("/bulk-tag")
+def bulk_tag(payload: BulkTagRequest):
+
+    ids = sorted(set(payload.contact_ids))
+
+    tag = payload.tag.strip()
+
+    if (
+        any(i <= 0 for i in ids)
+        or not tag
+        or "," in tag
+    ):
+        raise HTTPException(
+            422,
+            "Enter one valid tag and select contacts.",
+        )
+
+    with db_connect() as conn, conn.cursor() as cur:
+
+        cur.execute("""
+            SELECT id, tags
+
+            FROM contacts
+
+            WHERE id = ANY(%s)
+
+            ORDER BY id
+
+            FOR UPDATE
+
+        """, (ids,))
+
+        rows = cur.fetchall()
+
+        existing = 0
+        updated = 0
+        full = 0
+
+        for row in rows:
+
+            tags = row["tags"] or []
+
+            if any(
+                t.casefold() == tag.casefold()
+                for t in tags
+            ):
+                existing += 1
+                continue
+
+            if len(tags) >= 20:
+                full += 1
+                continue
+
+            cur.execute("""
+                UPDATE contacts
+
+                SET tags = array_append(tags, %s),
+                    updated_at = NOW()
+
+                WHERE id = %s
+
+            """, (
+                tag,
+                row["id"],
+            ))
+
+            updated += 1
+
+    return {
+        "updated": updated,
+        "already_tagged": existing,
+        "tag_limit": full,
+        "missing": len(ids) - len(rows),
     }
