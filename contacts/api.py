@@ -26,11 +26,8 @@ router = APIRouter(
 CONTACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (
     id BIGSERIAL PRIMARY KEY,
-
     phone TEXT NOT NULL UNIQUE,
-
     name VARCHAR(150) NOT NULL DEFAULT '',
-
     location VARCHAR(255) NOT NULL DEFAULT '',
 
     source TEXT NOT NULL
@@ -48,24 +45,15 @@ CREATE TABLE IF NOT EXISTS contacts (
         ),
 
     consent_at TIMESTAMPTZ,
-
     consent_source TEXT,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-
-    ALTER TABLE contacts
-        ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
-
-    CREATE INDEX IF NOT EXISTS contacts_active_idx
-    ON contacts(id)
-    WHERE archived_at IS NULL;
 );
 
 ALTER TABLE contacts
-ADD COLUMN IF NOT EXISTS contact_type TEXT
-NOT NULL DEFAULT 'unclassified'
+ADD COLUMN IF NOT EXISTS contact_type
+TEXT NOT NULL DEFAULT 'unclassified'
 CHECK (
     contact_type IN (
         'unclassified',
@@ -77,13 +65,18 @@ CHECK (
     )
 );
 
+ALTER TABLE contacts
+ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS contacts_active_idx
+ON contacts(id)
+WHERE archived_at IS NULL;
+
 CREATE INDEX IF NOT EXISTS contacts_type_idx
 ON contacts(contact_type);
 
-
 CREATE INDEX IF NOT EXISTS contacts_consent_idx
 ON contacts(consent_status);
-
 
 CREATE TABLE IF NOT EXISTS contact_consent_events (
     id BIGSERIAL PRIMARY KEY,
