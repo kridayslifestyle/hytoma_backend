@@ -594,3 +594,185 @@ def campaign_details(campaign_id: int):
                 **result,
 
             }
+
+def lock_unused_draft(cur, campaign_id):
+    cur.execute(
+        """
+        SELECT * FROM marketing_campaigns
+        WHERE id=%s FOR UPDATE
+        """,
+        (campaign_id,),
+    )
+
+    row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(404, "Campaign not found.")
+
+    if row["status"] != "draft":
+        raise HTTPException(
+            409,
+            "Only unsent drafts can be edited or deleted.",
+        )
+
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT 1
+            FROM campaign_recipients
+            WHERE campaign_id=%s
+            AND (
+                send_status <> 'pending'
+                OR attempted_at IS NOT NULL
+                OR wamid IS NOT NULL
+            )
+        ) OR EXISTS (
+            SELECT 1
+            FROM campaign_test_sends
+            WHERE campaign_id=%s
+        ) AS used
+    """, (campaign_id, campaign_id))
+
+    if cur.fetchone()["used"]:
+        raise HTTPException(
+            409,
+            "This campaign has send history. Duplicate it instead.",
+        )
+
+    return row
+
+
+def clear_archive(cur, campaign_id):
+    cur.execute("""
+        SELECT to_regclass(
+            'campaign_media_archive'
+        ) AS archive
+    """)
+
+    if cur.fetchone()["archive"]:
+        cur.execute("""
+            DELETE FROM campaign_media_archive
+            WHERE campaign_id=%s
+        """, (campaign_id,))
+
+
+@router.patch("/{campaign_id}")
+def edit_campaign(
+    campaign_id: int,
+    payload: CampaignCreate,
+):
+    name = payload.name.strip()
+
+    if not name:
+        raise HTTPException(
+            422, "Campaign name is required."
+        )
+
+    template = next(
+        (
+            t for t in eligible_templates()
+            if str(t.get("id")) == payload.template_id
+        ),
+        None,
+    )
+
+    if not template:
+        raise HTTPException(
+            422,
+            "Select an approved marketing template.",
+        )
+
+    with db_connect() as conn, conn.cursor() as cur:
+
+        row = lock_unused_draft(cur, campaign_id)
+
+        rows = audience_rows(cur, payload.audience)
+
+        if not rows or len(rows) > MAX_RECIPIENTS:
+            raise HTTPException(
+                422,
+                "Select between 1 and 5000 eligible contacts.",
+            )
+
+        changed = (
+            row["template_id"] != payload.template_id
+            or row["template_snapshot"] != template
+        )
+
+        if changed:
+            clear_archive(cur, campaign_id)
+
+            cur.execute("""
+                UPDATE marketing_campaigns
+                SET media_id=NULL,
+                    media_type=NULL,
+                    media_filename=NULL,
+                    media_uploaded_at=NULL,
+                    template_values='{}'
+                WHERE id=%s
+            """, (campaign_id,))
+
+        cur.execute("""
+            UPDATE marketing_campaigns
+            SET name=%s,
+                template_id=%s,
+                template_name=%s,
+                template_language=%s,
+                template_snapshot=%s,
+                audience_filters=%s
+            WHERE id=%s
+            RETURNING id, name, status
+        """, (
+            name,
+            payload.template_id,
+            template["name"],
+            template["language"],
+            Jsonb(template),
+            Jsonb(payload.audience.model_dump()),
+            campaign_id,
+        ))
+
+        campaign = cur.fetchone()
+
+        cur.execute("""
+            DELETE FROM campaign_recipients
+            WHERE campaign_id=%s
+        """, (campaign_id,))
+
+        cur.executemany("""
+            INSERT INTO campaign_recipients (
+                campaign_id,
+                contact_id
+            )
+            VALUES (%s, %s)
+        """, [
+            (campaign_id, r["id"])
+            for r in rows
+        ])
+
+    return {
+        "campaign": campaign,
+        "recipients": len(rows),
+        "configuration_reset": changed,
+    }
+
+
+@router.delete("/{campaign_id}")
+def delete_campaign(campaign_id: int):
+
+    with db_connect() as conn, conn.cursor() as cur:
+
+        lock_unused_draft(cur, campaign_id)
+
+        clear_archive(cur, campaign_id)
+
+        cur.execute("""
+            DELETE FROM campaign_recipients
+            WHERE campaign_id=%s
+        """, (campaign_id,))
+
+        cur.execute("""
+            DELETE FROM marketing_campaigns
+            WHERE id=%s
+        """, (campaign_id,))
+
+    return {"deleted": True}
