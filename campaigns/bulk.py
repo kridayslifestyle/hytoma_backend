@@ -3,6 +3,7 @@ import logging
 import os
 
 import requests
+from datetime import datetime, timezone, timedelta
 
 from fastapi import (
     APIRouter,
@@ -33,7 +34,6 @@ from campaigns.send_test import (
 
 from whatsapp_service import send_whatsapp_payload
 
-
 logger = logging.getLogger("hytoma.campaigns")
 
 router = APIRouter(
@@ -49,13 +49,15 @@ PILOT_MAX = 10
 # Database Migration
 # --------------------------------------------------
 
+
 def initialize_campaign_queue():
 
     with db_connect() as conn:
 
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
 
                 ALTER TABLE marketing_campaigns
 
@@ -71,6 +73,7 @@ def initialize_campaign_queue():
                 CHECK (
                     status IN (
                         'draft',
+                        'scheduled',
                         'running',
                         'paused',
                         'cancelled',
@@ -86,6 +89,8 @@ def initialize_campaign_queue():
 
                 ADD COLUMN IF NOT EXISTS
                     finished_at TIMESTAMPTZ;
+
+                ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ;
 
 
                 ALTER TABLE campaign_recipients
@@ -121,91 +126,74 @@ def initialize_campaign_queue():
 
                 WHERE wamid IS NOT NULL;
 
-            """, prepare=False)
+            """,
+                prepare=False,
+            )
 
 
 # --------------------------------------------------
 # Safety Configuration
 # --------------------------------------------------
 
+
 def allowed_numbers():
 
     return {
-
         number.strip().lstrip("+")
-
         for number in os.getenv(
             "CAMPAIGN_TEST_NUMBERS",
             "",
         ).split(",")
-
         if number.strip()
-
     }
 
 
 def enabled():
 
-    return os.getenv(
-
-        "CAMPAIGN_BULK_ENABLED",
-        "",
-
-    ).lower() == "true"
+    return (
+        os.getenv(
+            "CAMPAIGN_BULK_ENABLED",
+            "",
+        ).lower()
+        == "true"
+    )
 
 
 # --------------------------------------------------
 # Validate Template and Build Message
 # --------------------------------------------------
 
+
 def validate_message(row):
 
     live = next(
-
         (
             template
-
             for template in eligible_templates()
-
-            if str(template.get("id"))
-                == row["template_id"]
+            if str(template.get("id")) == row["template_id"]
         ),
-
         None,
-
     )
 
     if (
-
         not live
-
-        or live.get("name")
-            != row["template_name"]
-
-        or live.get("language")
-            != row["template_language"]
-
-        or signature(
-            live.get("components", [])
-        ) != signature(
+        or live.get("name") != row["template_name"]
+        or live.get("language") != row["template_language"]
+        or signature(live.get("components", []))
+        != signature(
             row["template_snapshot"].get(
                 "components",
                 [],
             )
         )
-
     ):
 
         raise HTTPException(
-
             409,
-
             "Template changed or is not approved.",
-
         )
 
     components = build_components(row)
-
 
     # Identify campaign quick replies separately
     # from test message quick replies.
@@ -214,31 +202,23 @@ def validate_message(row):
 
         if component.get("sub_type") == "quick_reply":
 
-            component["parameters"][0]["payload"] = (
-
-                component["parameters"][0]["payload"]
-
-                .replace(
-                    "campaign_test:",
-                    "campaign:",
-                    1,
-                )
-
+            component["parameters"][0]["payload"] = component["parameters"][0][
+                "payload"
+            ].replace(
+                "campaign_test:",
+                "campaign:",
+                1,
             )
-
 
     # Verify actual uploaded media.
 
     verify_media(row)
 
     message = {
-
         "name": row["template_name"],
-
         "language": {
             "code": row["template_language"],
         },
-
     }
 
     if components:
@@ -252,6 +232,7 @@ def validate_message(row):
 # Retrieve Campaign
 # --------------------------------------------------
 
+
 def campaign_row(
     cur,
     campaign_id,
@@ -259,18 +240,9 @@ def campaign_row(
 ):
 
     cur.execute(
-
         "SELECT * FROM marketing_campaigns "
-        "WHERE id=%s"
-
-        + (
-            " FOR UPDATE"
-            if lock
-            else ""
-        ),
-
+        "WHERE id=%s" + (" FOR UPDATE" if lock else ""),
         (campaign_id,),
-
     )
 
     row = cur.fetchone()
@@ -289,6 +261,7 @@ def campaign_row(
 # Request Models
 # --------------------------------------------------
 
+
 class LaunchRequest(BaseModel):
 
     confirmed: StrictBool
@@ -298,6 +271,8 @@ class LaunchRequest(BaseModel):
         le=PILOT_MAX,
     )
 
+class ScheduleRequest(LaunchRequest):
+    scheduled_at: datetime
 
 class ConfirmRequest(BaseModel):
 
@@ -308,197 +283,294 @@ class ConfirmRequest(BaseModel):
 # Launch Campaign
 # --------------------------------------------------
 
+
+def prepare_campaign(
+    campaign_id,
+    payload,
+    scheduled_at=None,
+):
+
+    # Existing pilot protection.
+
+    if not enabled() or not allowed_numbers():
+        raise HTTPException(
+            403,
+            "Pilot sending is disabled or allowlist missing."
+        )
+
+    if not payload.confirmed:
+        raise HTTPException(
+            422,
+            "Confirm the saved audience."
+        )
+
+
+    permitted = (
+        ("draft", "scheduled")
+        if scheduled_at
+        else ("draft",)
+    )
+
+
+    # Validate scheduling time.
+
+    if scheduled_at:
+
+        now = datetime.now(timezone.utc)
+
+        if (
+            scheduled_at.tzinfo is None
+            or not (
+                now + timedelta(minutes=1)
+                <= scheduled_at
+                <= now + timedelta(days=7)
+            )
+        ):
+            raise HTTPException(
+                422,
+                "Schedule between 1 minute and 7 days "
+                "in the future with a timezone."
+            )
+
+
+    # Load and validate campaign configuration.
+
+    with db_connect() as conn, conn.cursor() as cur:
+
+        row = campaign_row(
+            cur,
+            campaign_id
+        )
+
+
+    if row["status"] not in permitted:
+        raise HTTPException(
+            409,
+            "Campaign cannot be launched or scheduled "
+            "in its current status."
+        )
+
+
+    validate_message(row)
+
+
+    # Lock campaign and verify that its configuration
+    # has not changed during validation.
+
+    with db_connect() as conn, conn.cursor() as cur:
+
+        current = campaign_row(
+            cur,
+            campaign_id,
+            True
+        )
+
+        if (
+            current["status"] != row["status"]
+
+            or current["scheduled_at"]
+            != row["scheduled_at"]
+
+            or any(
+                current[key] != row[key]
+
+                for key in (
+                    "template_snapshot",
+                    "template_values",
+                    "media_id",
+                    "media_type",
+                )
+            )
+        ):
+            raise HTTPException(
+                409,
+                "Campaign changed. Review again."
+            )
+
+
+        # Re-check recipient eligibility.
+
+        cur.execute("""
+            SELECT
+                c.phone,
+                c.consent_status,
+
+                EXISTS (
+                    SELECT 1
+                    FROM leads l
+                    WHERE l.phone = c.phone
+                      AND l.status = 'opted_out'
+                ) AS blocked
+
+            FROM campaign_recipients r
+
+            JOIN contacts c
+                ON c.id = r.contact_id
+
+            WHERE r.campaign_id = %s
+              AND r.send_status = 'pending'
+
+        """, (campaign_id,))
+
+
+        recipients = cur.fetchall()
+
+
+        if (
+            len(recipients)
+            != payload.expected_recipients
+
+            or not recipients
+
+            or len(recipients) > PILOT_MAX
+        ):
+            raise HTTPException(
+                422,
+                "Recipient count changed "
+                "or exceeds pilot limit."
+            )
+
+
+        if any(
+            r["phone"] not in allowed_numbers()
+            or r["consent_status"] != "opted_in"
+            or r["blocked"]
+
+            for r in recipients
+        ):
+            raise HTTPException(
+                403,
+                "All pilot recipients must be "
+                "authorized and opted in."
+            )
+
+
+        # Schedule campaign.
+
+        if scheduled_at:
+
+            cur.execute("""
+                UPDATE marketing_campaigns
+
+                SET status = 'scheduled',
+                    scheduled_at = %s
+
+                WHERE id = %s
+
+            """, (
+                scheduled_at,
+                campaign_id,
+            ))
+
+
+        # Start campaign immediately.
+
+        else:
+
+            cur.execute("""
+                UPDATE marketing_campaigns
+
+                SET status = 'running',
+                    started_at = NOW(),
+                    scheduled_at = NULL
+
+                WHERE id = %s
+
+            """, (campaign_id,))
+
+
+    return {
+
+        "status": (
+            "scheduled"
+            if scheduled_at
+            else "running"
+        ),
+
+        "recipients": len(recipients),
+
+        "scheduled_at": scheduled_at,
+
+    }
+
+
+# Send Now API
+
 @router.post("/{campaign_id}/launch")
 def launch(
     campaign_id: int,
     payload: LaunchRequest,
 ):
 
-    if not enabled() or not allowed_numbers():
+    return prepare_campaign(
+        campaign_id,
+        payload,
+    )
 
-        raise HTTPException(
 
-            403,
+# Schedule and Reschedule API
 
-            "Pilot sending is disabled "
-            "or allowlist missing.",
+@router.post("/{campaign_id}/schedule")
+def schedule(
+    campaign_id: int,
+    payload: ScheduleRequest,
+):
 
-        )
+    return prepare_campaign(
+        campaign_id,
+        payload,
+        payload.scheduled_at,
+    )
+
+
+# Remove schedule and return to draft.
+
+@router.post("/{campaign_id}/unschedule")
+def unschedule(
+    campaign_id: int,
+    payload: ConfirmRequest,
+):
 
     if not payload.confirmed:
-
         raise HTTPException(
-
             422,
-
-            "Confirm campaign launch.",
-
+            "Confirm removing the schedule."
         )
 
 
-    # Load existing campaign.
+    with db_connect() as conn, conn.cursor() as cur:
 
-    with db_connect() as conn:
+        cur.execute("""
+            UPDATE marketing_campaigns
 
-        with conn.cursor() as cur:
+            SET status = 'draft',
+                scheduled_at = NULL
 
-            row = campaign_row(
-                cur,
-                campaign_id,
+            WHERE id = %s
+              AND status = 'scheduled'
+
+            RETURNING id
+
+        """, (campaign_id,))
+
+
+        if not cur.fetchone():
+
+            raise HTTPException(
+                409,
+                "Only scheduled campaigns "
+                "can be unscheduled."
             )
 
-    if row["status"] != "draft":
-
-        raise HTTPException(
-
-            409,
-
-            "Only drafts can be launched.",
-
-        )
-
-
-    # Validate saved message.
-
-    validate_message(row)
-
-
-    # --------------------------------------------------
-    # Activate Campaign
-    # --------------------------------------------------
-
-    with db_connect() as conn:
-
-        with conn.cursor() as cur:
-
-            current = campaign_row(
-                cur,
-                campaign_id,
-                True,
-            )
-
-            if (
-
-                current["status"] != "draft"
-
-                or any(
-
-                    current[key] != row[key]
-
-                    for key in (
-
-                        "template_snapshot",
-
-                        "template_values",
-
-                        "media_id",
-
-                        "media_type",
-
-                    )
-
-                )
-
-            ):
-
-                raise HTTPException(
-
-                    409,
-
-                    "Draft changed. Review again.",
-
-                )
-
-
-            # Check saved recipients.
-
-            cur.execute("""
-
-                SELECT c.phone
-
-                FROM campaign_recipients r
-
-                JOIN contacts c
-                    ON c.id = r.contact_id
-
-                WHERE r.campaign_id = %s
-
-            """, (campaign_id,))
-
-            phones = [
-
-                recipient["phone"]
-
-                for recipient in cur.fetchall()
-
-            ]
-
-            if (
-
-                len(phones)
-                    != payload.expected_recipients
-
-                or not phones
-
-                or len(phones) > PILOT_MAX
-
-            ):
-
-                raise HTTPException(
-
-                    422,
-
-                    "Recipient count changed "
-                    "or exceeds pilot limit.",
-
-                )
-
-
-            # Initial pilot mode:
-            # Only authorized test numbers.
-
-            if not set(phones).issubset(
-                allowed_numbers()
-            ):
-
-                raise HTTPException(
-
-                    403,
-
-                    "All pilot recipients must be "
-                    "authorized test numbers.",
-
-                )
-
-
-            # Launch campaign.
-
-            cur.execute("""
-
-                UPDATE marketing_campaigns
-
-                SET
-
-                    status = 'running',
-
-                    started_at = NOW()
-
-                WHERE id = %s
-
-            """, (campaign_id,))
 
     return {
-
-        "status": "running",
-
-        "recipients": len(phones),
-
+        "status": "draft"
     }
-
 
 # --------------------------------------------------
 # Pause Campaign
 # --------------------------------------------------
+
 
 @router.post("/{campaign_id}/pause")
 def pause(campaign_id: int):
@@ -507,7 +579,8 @@ def pause(campaign_id: int):
 
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
 
                 UPDATE marketing_campaigns
 
@@ -519,28 +592,26 @@ def pause(campaign_id: int):
 
                 RETURNING id
 
-            """, (campaign_id,))
+            """,
+                (campaign_id,),
+            )
 
             if not cur.fetchone():
 
                 raise HTTPException(
-
                     409,
-
                     "Only running campaigns can pause.",
-
                 )
 
     return {
-
         "status": "paused",
-
     }
 
 
 # --------------------------------------------------
 # Resume Campaign
 # --------------------------------------------------
+
 
 @router.post("/{campaign_id}/resume")
 def resume(
@@ -551,18 +622,16 @@ def resume(
     if not enabled() or not payload.confirmed:
 
         raise HTTPException(
-
             403,
-
             "Pilot disabled or confirmation missing.",
-
         )
 
     with db_connect() as conn:
 
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
 
                 UPDATE marketing_campaigns
 
@@ -574,28 +643,26 @@ def resume(
 
                 RETURNING id
 
-            """, (campaign_id,))
+            """,
+                (campaign_id,),
+            )
 
             if not cur.fetchone():
 
                 raise HTTPException(
-
                     409,
-
                     "Only paused campaigns can resume.",
-
                 )
 
     return {
-
         "status": "running",
-
     }
 
 
 # --------------------------------------------------
 # Cancel Campaign
 # --------------------------------------------------
+
 
 @router.post("/{campaign_id}/cancel")
 def cancel(
@@ -606,18 +673,16 @@ def cancel(
     if not payload.confirmed:
 
         raise HTTPException(
-
             422,
-
             "Confirm cancellation.",
-
         )
 
     with db_connect() as conn:
 
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
 
                 UPDATE marketing_campaigns
 
@@ -633,6 +698,8 @@ def cancel(
 
                     'draft',
 
+                    'scheduled',
+
                     'running',
 
                     'paused'
@@ -641,22 +708,21 @@ def cancel(
 
                 RETURNING id
 
-            """, (campaign_id,))
+            """,
+                (campaign_id,),
+            )
 
             if not cur.fetchone():
 
                 raise HTTPException(
-
                     409,
-
                     "Campaign cannot be cancelled.",
-
                 )
-
 
             # Cancel recipients not yet processed.
 
-            cur.execute("""
+            cur.execute(
+                """
 
                 UPDATE campaign_recipients
 
@@ -666,12 +732,12 @@ def cancel(
 
                 AND send_status = 'pending'
 
-            """, (campaign_id,))
+            """,
+                (campaign_id,),
+            )
 
     return {
-
         "status": "cancelled",
-
     }
 
 
@@ -679,42 +745,36 @@ def cancel(
 # Campaign Progress
 # --------------------------------------------------
 
+
 @router.get("/{campaign_id}/progress")
 def progress(campaign_id: int):
 
-    with db_connect() as conn:
+    with db_connect() as conn, conn.cursor() as cur:
 
-        with conn.cursor() as cur:
+        row = campaign_row(
+            cur,
+            campaign_id
+        )
 
-            row = campaign_row(
-                cur,
-                campaign_id,
-            )
+        cur.execute("""
+            SELECT
+                send_status,
+                COUNT(*) AS count
 
-            cur.execute("""
+            FROM campaign_recipients
 
-                SELECT
+            WHERE campaign_id = %s
 
-                    send_status,
+            GROUP BY send_status
 
-                    COUNT(*) AS count
+        """, (campaign_id,))
 
-                FROM campaign_recipients
+        counts = {
+            r["send_status"]: r["count"]
 
-                WHERE campaign_id = %s
+            for r in cur.fetchall()
+        }
 
-                GROUP BY send_status
-
-            """, (campaign_id,))
-
-            counts = {
-
-                recipient["send_status"]:
-                    recipient["count"]
-
-                for recipient in cur.fetchall()
-
-            }
 
     return {
 
@@ -724,16 +784,25 @@ def progress(campaign_id: int):
 
         "counts": counts,
 
-    }
+        "scheduled_at": row["scheduled_at"],
+
+        "pilot_enabled": (
+            enabled()
+            and bool(allowed_numbers())
+        ),
+
+    }  
 
 
 # --------------------------------------------------
 # Complete Campaign
 # --------------------------------------------------
 
+
 def finish(cur, campaign_id):
 
-    cur.execute("""
+    cur.execute(
+        """
 
         UPDATE marketing_campaigns
 
@@ -765,25 +834,24 @@ def finish(cur, campaign_id):
 
         )
 
-    """, (
-
-        campaign_id,
-
-        campaign_id,
-
-    ))
+    """,
+        (
+            campaign_id,
+            campaign_id,
+        ),
+    )
 
 
 # --------------------------------------------------
 # Process One Campaign Recipient
 # --------------------------------------------------
 
+
 def process_campaign_once():
 
     if not enabled():
 
         return
-
 
     # Global PostgreSQL lock.
     # Prevent multiple workers from sending
@@ -804,7 +872,6 @@ def process_campaign_once():
             if not guard.fetchone()["locked"]:
 
                 return
-
 
             # --------------------------------------------------
             # Recover Interrupted Jobs
@@ -830,17 +897,12 @@ def process_campaign_once():
 
                     """)
 
-                    affected = {
-
-                        row["campaign_id"]
-
-                        for row in cur.fetchall()
-
-                    }
+                    affected = {row["campaign_id"] for row in cur.fetchall()}
 
                     for campaign_id in affected:
 
-                        cur.execute("""
+                        cur.execute(
+                            """
 
                             UPDATE marketing_campaigns
 
@@ -850,10 +912,39 @@ def process_campaign_once():
 
                             AND status = 'running'
 
-                        """, (campaign_id,))
-
+                        """,
+                            (campaign_id,),
+                        )
 
                     # Global minimum send interval.
+
+                    # Return missed schedules to draft after excessive downtime.
+
+                        cur.execute("""
+                            UPDATE marketing_campaigns
+
+                            SET status = 'draft',
+                            scheduled_at = NULL
+
+                            WHERE status = 'scheduled'
+
+                            AND scheduled_at
+                            < NOW() - INTERVAL '15 minutes'
+                        """)
+
+
+# Start campaigns whose scheduled time has arrived.
+
+                        cur.execute("""
+                            UPDATE marketing_campaigns
+
+                            SET status = 'running',
+                            started_at = NOW()
+
+                            WHERE status = 'scheduled'
+
+                            AND scheduled_at <= NOW()
+                        """)
 
                     cur.execute("""
 
@@ -872,7 +963,6 @@ def process_campaign_once():
                     if cur.fetchone():
 
                         return
-
 
                     # Find an active campaign.
 
@@ -903,10 +993,10 @@ def process_campaign_once():
                         cid,
                     )
 
-
                     # Get next pending recipient.
 
-                    cur.execute("""
+                    cur.execute(
+                        """
 
                         SELECT
 
@@ -928,7 +1018,9 @@ def process_campaign_once():
 
                         LIMIT 1
 
-                    """, (cid,))
+                    """,
+                        (cid,),
+                    )
 
                     recipient = cur.fetchone()
 
@@ -937,7 +1029,6 @@ def process_campaign_once():
                         finish(cur, cid)
 
                         return
-
 
             # --------------------------------------------------
             # Validate Campaign Message
@@ -953,7 +1044,8 @@ def process_campaign_once():
 
                     with conn.cursor() as cur:
 
-                        cur.execute("""
+                        cur.execute(
+                            """
 
                             UPDATE marketing_campaigns
 
@@ -963,15 +1055,15 @@ def process_campaign_once():
 
                             AND status = 'running'
 
-                        """, (cid,))
+                        """,
+                            (cid,),
+                        )
 
                 return
-
 
             phone = recipient["phone"]
 
             rid = recipient["contact_id"]
-
 
             # --------------------------------------------------
             # Lock Individual Recipient
@@ -984,30 +1076,19 @@ def process_campaign_once():
                     with conn.cursor() as cur:
 
                         current = campaign_row(
-
                             cur,
-
                             cid,
-
                             True,
-
                         )
 
-                        if (
-
-                            not enabled()
-
-                            or current["status"]
-                                != "running"
-
-                        ):
+                        if not enabled() or current["status"] != "running":
 
                             return
 
-
                         # Recheck latest contact consent.
 
-                        cur.execute("""
+                        cur.execute(
+                            """
 
                             SELECT
 
@@ -1031,40 +1112,26 @@ def process_campaign_once():
 
                             WHERE c.id = %s
 
-                        """, (rid,))
+                        """,
+                            (rid,),
+                        )
 
                         contact = cur.fetchone()
-
 
                         # Exclude opted-out or
                         # unauthorized recipients.
 
                         if (
-
                             not contact
-
                             or contact["phone"] != phone
-
-                            or contact["consent_status"]
-                                != "opted_in"
-
+                            or contact["consent_status"] != "opted_in"
                             or contact["blocked"]
-
                             or phone not in allowed_numbers()
-
-                            or (
-
-                                phone.startswith(
-                                    "120255501"
-                                )
-
-                                and len(phone) == 11
-
-                            )
-
+                            or (phone.startswith("120255501") and len(phone) == 11)
                         ):
 
-                            cur.execute("""
+                            cur.execute(
+                                """
 
                                 UPDATE campaign_recipients
 
@@ -1081,17 +1148,19 @@ def process_campaign_once():
 
                                 AND send_status = 'pending'
 
-                            """, (cid, rid))
+                            """,
+                                (cid, rid),
+                            )
 
                             finish(cur, cid)
 
                             return
 
-
                         # Persist send state BEFORE
                         # contacting the external API.
 
-                        cur.execute("""
+                        cur.execute(
+                            """
 
                             UPDATE campaign_recipients
 
@@ -1109,12 +1178,13 @@ def process_campaign_once():
 
                             RETURNING contact_id
 
-                        """, (cid, rid))
+                        """,
+                            (cid, rid),
+                        )
 
                         if not cur.fetchone():
 
                             return
-
 
                 # --------------------------------------------------
                 # Send WhatsApp Message
@@ -1128,56 +1198,35 @@ def process_campaign_once():
 
                 try:
 
-                    result = send_whatsapp_payload({
+                    result = send_whatsapp_payload(
+                        {
+                            "messaging_product": "whatsapp",
+                            "to": phone,
+                            "type": "template",
+                            "template": message,
+                        }
+                    )
 
-                        "messaging_product": "whatsapp",
-
-                        "to": phone,
-
-                        "type": "template",
-
-                        "template": message,
-
-                    })
-
-                    wamid = result[
-                        "messages"
-                    ][0]["id"]
+                    wamid = result["messages"][0]["id"]
 
                     status = "accepted"
 
                     error = None
 
-
                 except requests.HTTPError as exc:
 
                     if (
-
                         exc.response is not None
-
-                        and 400 <=
-                            exc.response.status_code < 500
-
+                        and 400 <= exc.response.status_code < 500
                     ):
 
                         status = "rejected"
 
-                        error = (
-
-                            f"Meta HTTP "
-                            f"{exc.response.status_code}"
-
-                        )
-
+                        error = f"Meta HTTP " f"{exc.response.status_code}"
 
                 except Exception:
 
-                    logger.exception(
-
-                        "Campaign request outcome uncertain"
-
-                    )
-
+                    logger.exception("Campaign request outcome uncertain")
 
                 # --------------------------------------------------
                 # Save Send Outcome
@@ -1193,7 +1242,8 @@ def process_campaign_once():
                             True,
                         )
 
-                        cur.execute("""
+                        cur.execute(
+                            """
 
                             UPDATE campaign_recipients
 
@@ -1211,27 +1261,23 @@ def process_campaign_once():
 
                             AND send_status = 'sending'
 
-                        """, (
-
-                            status,
-
-                            wamid,
-
-                            error,
-
-                            cid,
-
-                            rid,
-
-                        ))
-
+                        """,
+                            (
+                                status,
+                                wamid,
+                                error,
+                                cid,
+                                rid,
+                            ),
+                        )
 
                         # Pause campaign on errors.
                         # Do not keep sending blindly.
 
                         if status != "accepted":
 
-                            cur.execute("""
+                            cur.execute(
+                                """
 
                                 UPDATE marketing_campaigns
 
@@ -1241,8 +1287,9 @@ def process_campaign_once():
 
                                 AND status = 'running'
 
-                            """, (cid,))
-
+                            """,
+                                (cid,),
+                            )
 
                         # Complete if no pending jobs remain.
 
@@ -1253,17 +1300,14 @@ def process_campaign_once():
 # Background Campaign Worker
 # --------------------------------------------------
 
+
 async def campaign_worker_loop():
 
     while True:
 
         try:
 
-            await asyncio.to_thread(
-
-                process_campaign_once
-
-            )
+            await asyncio.to_thread(process_campaign_once)
 
         except asyncio.CancelledError:
 
@@ -1271,10 +1315,6 @@ async def campaign_worker_loop():
 
         except Exception:
 
-            logger.exception(
-
-                "Campaign queue error"
-
-            )
+            logger.exception("Campaign queue error")
 
         await asyncio.sleep(2)

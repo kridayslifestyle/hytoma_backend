@@ -64,6 +64,13 @@ from marketing_inbox.api import (
     initialize_marketing_inbox,
 )
 
+from marketing_inbox.api import (
+    router as marketing_inbox_router,
+    initialize_marketing_inbox,
+)
+
+import marketing_inbox.media
+
 load_dotenv()
 
 logging.basicConfig(
