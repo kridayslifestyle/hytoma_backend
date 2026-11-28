@@ -90,7 +90,8 @@ def initialize_campaign_queue():
                 ADD COLUMN IF NOT EXISTS
                     finished_at TIMESTAMPTZ;
 
-                ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ;
+                ALTER TABLE marketing_campaigns
+                    ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ;
 
 
                 ALTER TABLE campaign_recipients
@@ -271,8 +272,10 @@ class LaunchRequest(BaseModel):
         le=PILOT_MAX,
     )
 
+
 class ScheduleRequest(LaunchRequest):
     scheduled_at: datetime
+
 
 class ConfirmRequest(BaseModel):
 
@@ -293,24 +296,12 @@ def prepare_campaign(
     # Existing pilot protection.
 
     if not enabled() or not allowed_numbers():
-        raise HTTPException(
-            403,
-            "Pilot sending is disabled or allowlist missing."
-        )
+        raise HTTPException(403, "Pilot sending is disabled or allowlist missing.")
 
     if not payload.confirmed:
-        raise HTTPException(
-            422,
-            "Confirm the saved audience."
-        )
+        raise HTTPException(422, "Confirm the saved audience.")
 
-
-    permitted = (
-        ("draft", "scheduled")
-        if scheduled_at
-        else ("draft",)
-    )
-
+    permitted = ("draft", "scheduled") if scheduled_at else ("draft",)
 
     # Validate scheduling time.
 
@@ -318,62 +309,40 @@ def prepare_campaign(
 
         now = datetime.now(timezone.utc)
 
-        if (
-            scheduled_at.tzinfo is None
-            or not (
-                now + timedelta(minutes=1)
-                <= scheduled_at
-                <= now + timedelta(days=7)
-            )
+        if scheduled_at.tzinfo is None or not (
+            now + timedelta(minutes=1) <= scheduled_at <= now + timedelta(days=7)
         ):
             raise HTTPException(
                 422,
                 "Schedule between 1 minute and 7 days "
-                "in the future with a timezone."
+                "in the future with a timezone.",
             )
-
 
     # Load and validate campaign configuration.
 
     with db_connect() as conn, conn.cursor() as cur:
 
-        row = campaign_row(
-            cur,
-            campaign_id
-        )
-
+        row = campaign_row(cur, campaign_id)
 
     if row["status"] not in permitted:
         raise HTTPException(
-            409,
-            "Campaign cannot be launched or scheduled "
-            "in its current status."
+            409, "Campaign cannot be launched or scheduled " "in its current status."
         )
 
-
     validate_message(row)
-
 
     # Lock campaign and verify that its configuration
     # has not changed during validation.
 
     with db_connect() as conn, conn.cursor() as cur:
 
-        current = campaign_row(
-            cur,
-            campaign_id,
-            True
-        )
+        current = campaign_row(cur, campaign_id, True)
 
         if (
             current["status"] != row["status"]
-
-            or current["scheduled_at"]
-            != row["scheduled_at"]
-
+            or current["scheduled_at"] != row["scheduled_at"]
             or any(
                 current[key] != row[key]
-
                 for key in (
                     "template_snapshot",
                     "template_values",
@@ -382,15 +351,12 @@ def prepare_campaign(
                 )
             )
         ):
-            raise HTTPException(
-                409,
-                "Campaign changed. Review again."
-            )
-
+            raise HTTPException(409, "Campaign changed. Review again.")
 
         # Re-check recipient eligibility.
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT
                 c.phone,
                 c.consent_status,
@@ -410,46 +376,37 @@ def prepare_campaign(
             WHERE r.campaign_id = %s
               AND r.send_status = 'pending'
 
-        """, (campaign_id,))
-
+        """,
+            (campaign_id,),
+        )
 
         recipients = cur.fetchall()
 
-
         if (
-            len(recipients)
-            != payload.expected_recipients
-
+            len(recipients) != payload.expected_recipients
             or not recipients
-
             or len(recipients) > PILOT_MAX
         ):
             raise HTTPException(
-                422,
-                "Recipient count changed "
-                "or exceeds pilot limit."
+                422, "Recipient count changed " "or exceeds pilot limit."
             )
-
 
         if any(
             r["phone"] not in allowed_numbers()
             or r["consent_status"] != "opted_in"
             or r["blocked"]
-
             for r in recipients
         ):
             raise HTTPException(
-                403,
-                "All pilot recipients must be "
-                "authorized and opted in."
+                403, "All pilot recipients must be " "authorized and opted in."
             )
-
 
         # Schedule campaign.
 
         if scheduled_at:
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE marketing_campaigns
 
                 SET status = 'scheduled',
@@ -457,17 +414,19 @@ def prepare_campaign(
 
                 WHERE id = %s
 
-            """, (
-                scheduled_at,
-                campaign_id,
-            ))
-
+            """,
+                (
+                    scheduled_at,
+                    campaign_id,
+                ),
+            )
 
         # Start campaign immediately.
 
         else:
 
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE marketing_campaigns
 
                 SET status = 'running',
@@ -476,25 +435,19 @@ def prepare_campaign(
 
                 WHERE id = %s
 
-            """, (campaign_id,))
-
+            """,
+                (campaign_id,),
+            )
 
     return {
-
-        "status": (
-            "scheduled"
-            if scheduled_at
-            else "running"
-        ),
-
+        "status": ("scheduled" if scheduled_at else "running"),
         "recipients": len(recipients),
-
         "scheduled_at": scheduled_at,
-
     }
 
 
 # Send Now API
+
 
 @router.post("/{campaign_id}/launch")
 def launch(
@@ -509,6 +462,7 @@ def launch(
 
 
 # Schedule and Reschedule API
+
 
 @router.post("/{campaign_id}/schedule")
 def schedule(
@@ -525,6 +479,7 @@ def schedule(
 
 # Remove schedule and return to draft.
 
+
 @router.post("/{campaign_id}/unschedule")
 def unschedule(
     campaign_id: int,
@@ -532,15 +487,12 @@ def unschedule(
 ):
 
     if not payload.confirmed:
-        raise HTTPException(
-            422,
-            "Confirm removing the schedule."
-        )
-
+        raise HTTPException(422, "Confirm removing the schedule.")
 
     with db_connect() as conn, conn.cursor() as cur:
 
-        cur.execute("""
+        cur.execute(
+            """
             UPDATE marketing_campaigns
 
             SET status = 'draft',
@@ -551,21 +503,16 @@ def unschedule(
 
             RETURNING id
 
-        """, (campaign_id,))
-
+        """,
+            (campaign_id,),
+        )
 
         if not cur.fetchone():
 
-            raise HTTPException(
-                409,
-                "Only scheduled campaigns "
-                "can be unscheduled."
-            )
+            raise HTTPException(409, "Only scheduled campaigns " "can be unscheduled.")
 
+    return {"status": "draft"}
 
-    return {
-        "status": "draft"
-    }
 
 # --------------------------------------------------
 # Pause Campaign
@@ -751,12 +698,10 @@ def progress(campaign_id: int):
 
     with db_connect() as conn, conn.cursor() as cur:
 
-        row = campaign_row(
-            cur,
-            campaign_id
-        )
+        row = campaign_row(cur, campaign_id)
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT
                 send_status,
                 COUNT(*) AS count
@@ -767,31 +712,19 @@ def progress(campaign_id: int):
 
             GROUP BY send_status
 
-        """, (campaign_id,))
+        """,
+            (campaign_id,),
+        )
 
-        counts = {
-            r["send_status"]: r["count"]
-
-            for r in cur.fetchall()
-        }
-
+        counts = {r["send_status"]: r["count"] for r in cur.fetchall()}
 
     return {
-
         "status": row["status"],
-
         "total": sum(counts.values()),
-
         "counts": counts,
-
         "scheduled_at": row["scheduled_at"],
-
-        "pilot_enabled": (
-            enabled()
-            and bool(allowed_numbers())
-        ),
-
-    }  
+        "pilot_enabled": (enabled() and bool(allowed_numbers())),
+    }
 
 
 # --------------------------------------------------
@@ -916,9 +849,9 @@ def process_campaign_once():
                             (campaign_id,),
                         )
 
-                    # Global minimum send interval.
+                        # Global minimum send interval.
 
-                    # Return missed schedules to draft after excessive downtime.
+                        # Return missed schedules to draft after excessive downtime.
 
                         cur.execute("""
                             UPDATE marketing_campaigns
@@ -932,8 +865,7 @@ def process_campaign_once():
                             < NOW() - INTERVAL '15 minutes'
                         """)
 
-
-# Start campaigns whose scheduled time has arrived.
+                        # Start campaigns whose scheduled time has arrived.
 
                         cur.execute("""
                             UPDATE marketing_campaigns
