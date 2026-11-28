@@ -71,6 +71,8 @@ from marketing_inbox.api import (
 
 import marketing_inbox.media
 
+from marketing_inbox.actions import initialize_marketing_actions
+
 load_dotenv()
 
 logging.basicConfig(
@@ -145,6 +147,8 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(initialize_campaign_queue)
 
     await asyncio.to_thread(initialize_marketing_inbox)
+
+    await asyncio.to_thread(initialize_marketing_actions)
 
     worker = asyncio.create_task(worker_loop())
 
@@ -382,6 +386,7 @@ async def receive_webhook(request: Request):
                     ad_id,
                     display_content,
                     (msg.get("context") or {}).get("id"),
+                    msg.get("timestamp"),
                 )
 
     return {"status": "received"}

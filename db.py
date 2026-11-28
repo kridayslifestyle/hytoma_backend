@@ -16,8 +16,6 @@ from qualification import (
 )
 from whatsapp_service import send_qualification_reply
 
-
-
 logger = logging.getLogger("hytoma")
 
 
@@ -231,6 +229,9 @@ CREATE TABLE IF NOT EXISTS bot_outbound_requests (
 CREATE INDEX IF NOT EXISTS bot_outbound_pending_idx
 ON bot_outbound_requests (status, created_at);
 
+ALTER TABLE inbound_events
+ADD COLUMN IF NOT EXISTS message_at TIMESTAMPTZ;
+
 
 
 """
@@ -275,7 +276,6 @@ def customer_send_guard(phone: str):
             pass
 
 
-
 def initialize_database():
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -290,25 +290,36 @@ def enqueue_event(
     ad_id,
     display_content=None,
     context_id=None,
+    message_timestamp=None,
 ):
+    try:
+        message_at = datetime.fromtimestamp(int(message_timestamp), timezone.utc)
+
+    except (ValueError, TypeError, OverflowError, OSError):
+        message_at = None
+
     with db_connect() as conn:
         with conn.cursor() as cur:
 
             cur.execute(
                 """
-                INSERT INTO inbound_events
-                (
+                    INSERT INTO inbound_events (
                     message_id,
                     phone,
                     message_text,
                     sender_number_id,
-                    ad_id
-                )
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (message_id) DO NOTHING
-                RETURNING message_id
+                    ad_id,
+                    message_at
+            )
+
+                    VALUES (%s, %s, %s, %s, %s, %s)
+
+                    ON CONFLICT (message_id) DO NOTHING
+
+                    RETURNING message_id
+
             """,
-                (message_id, phone, message_text, sender_number_id, ad_id),
+                (message_id, phone, message_text, sender_number_id, ad_id, message_at),
             )
 
             inserted = cur.fetchone() is not None
@@ -318,12 +329,7 @@ def enqueue_event(
 
             from contacts.consent import record_inbound_opt_out
 
-            record_inbound_opt_out(
-                cur,
-                phone,
-                message_text,
-                display_content
-            )
+            record_inbound_opt_out(cur, phone, message_text, display_content)
 
             from marketing_inbox.api import route_campaign_reply
 
@@ -530,7 +536,6 @@ def process_next_event():
                         # Create new lead
                         if lead is None:
 
-
                             cur.execute(
                                 """
                                 INSERT INTO leads (
@@ -568,10 +573,8 @@ def process_next_event():
                                 ),
                             )
 
-
                         # Update existing lead
                         else:
-
 
                             cur.execute(
                                 """
@@ -606,7 +609,6 @@ def process_next_event():
                                     phone,
                                 ),
                             )
-
 
                             # Notify admin after qualification
                             # or customer requests a human
@@ -742,8 +744,7 @@ def mark_stale_bot_outbounds_unknown():
     """
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 UPDATE bot_outbound_requests
                 SET
                     status = 'unknown',
@@ -754,8 +755,7 @@ def mark_stale_bot_outbounds_unknown():
                 WHERE status = 'sending'
                   AND updated_at < NOW() - INTERVAL '10 minutes'
                 RETURNING inbound_message_id, phone
-                """
-            )
+                """)
 
             stale_jobs = cur.fetchall()
 
@@ -767,8 +767,6 @@ def mark_stale_bot_outbounds_unknown():
         )
 
     return len(stale_jobs)
-
-
 
 
 def process_next_bot_outbound():
@@ -790,8 +788,7 @@ def process_next_bot_outbound():
     with db_connect() as conn:
         with conn.cursor() as cur:
 
-            cur.execute(
-                """
+            cur.execute("""
                 SELECT b.*
                 FROM bot_outbound_requests AS b
                 WHERE b.status = 'pending'
@@ -815,9 +812,7 @@ def process_next_bot_outbound():
                 ORDER BY b.created_at, b.inbound_message_id
                 FOR UPDATE OF b SKIP LOCKED
                 LIMIT 1
-                """
-            )
-
+                """)
 
             job = cur.fetchone()
 
@@ -880,29 +875,18 @@ def process_next_bot_outbound():
             else:
                 messages_to_send = [response]
 
-            if (
-                not isinstance(messages_to_send, list)
-                or not messages_to_send
-            ):
-                raise ValueError(
-                    "Bot response sequence is empty or invalid"
-                )
+            if not isinstance(messages_to_send, list) or not messages_to_send:
+                raise ValueError("Bot response sequence is empty or invalid")
 
             for item in messages_to_send:
                 if not isinstance(item, dict):
-                    raise ValueError(
-                        "Invalid item in bot response sequence"
-                    )
+                    raise ValueError("Invalid item in bot response sequence")
 
                 if item.get("type") not in {"text", "list"}:
-                    raise ValueError(
-                        "Unsupported bot response type"
-                    )
+                    raise ValueError("Unsupported bot response type")
 
                 if not item.get("body"):
-                    raise ValueError(
-                        "Bot response is missing message body"
-                    )
+                    raise ValueError("Bot response is missing message body")
 
             # PHASE 4: Send and save each message in order.
             last_whatsapp_message_id = None
@@ -917,23 +901,17 @@ def process_next_bot_outbound():
                 )
 
                 if not isinstance(result, dict):
-                    raise RuntimeError(
-                        "No valid WhatsApp API response"
-                    )
+                    raise RuntimeError("No valid WhatsApp API response")
 
                 sent_messages = result.get("messages") or []
 
                 if not sent_messages:
-                    raise RuntimeError(
-                        "WhatsApp response contains no message ID"
-                    )
+                    raise RuntimeError("WhatsApp response contains no message ID")
 
                 whatsapp_message_id = sent_messages[0].get("id")
 
                 if not whatsapp_message_id:
-                    raise RuntimeError(
-                        "Missing WhatsApp message ID"
-                    )
+                    raise RuntimeError("Missing WhatsApp message ID")
 
                 last_whatsapp_message_id = whatsapp_message_id
 

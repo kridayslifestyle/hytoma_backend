@@ -28,6 +28,10 @@ class MediaUploadSizeLimitMiddleware:
                 )
             )
             or scope.get("method") != "POST"
+            or re.fullmatch(
+                r"/admin/marketing-inbox/conversations/[0-9]+/send",
+                scope.get("path", ""),
+            )
         ):
             await self.app(scope, receive, send)
             return
